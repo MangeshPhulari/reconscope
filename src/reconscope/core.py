@@ -159,14 +159,10 @@ class _HTMLDiscoveryParser(HTMLParser):
 
 
 # ---------------------------------------------------------------------------
-# Wayback Machine miner
+# Passive Source Miners (Wayback, OTX, CommonCrawl)
 # ---------------------------------------------------------------------------
 
-class WaybackMiner:
-    """Query the Wayback Machine CDX API to harvest historical URLs with parameters."""
-
-    CDX_URL = "https://web.archive.org/cdx/search/cdx"
-
+class BaseMiner:
     def __init__(
         self,
         placeholder: str = "FUZZ",
@@ -180,55 +176,156 @@ class WaybackMiner:
         self.filter_extensions = filter_extensions
 
     def mine(self, domain: str) -> list[str]:
-        """Return a deduplicated list of cleaned URLs (params replaced with placeholder)."""
-        raw = self._fetch_cdx(domain)
-        return self._clean_urls(raw)
-
-    def _fetch_cdx(self, domain: str) -> list[str]:
-        params = {
-            "url": f"{domain}/*",
-            "output": "txt",
-            "collapse": "urlkey",
-            "fl": "original",
-        }
-        try:
-            resp = requests.get(
-                self.CDX_URL,
-                params=params,
-                timeout=self.timeout,
-                proxies=self.proxies,
-            )
-            resp.raise_for_status()
-            return [line.strip() for line in resp.text.splitlines() if line.strip()]
-        except Exception:
-            return []
+        raise NotImplementedError
 
     def _clean_urls(self, urls: list[str]) -> list[str]:
         seen: set[str] = set()
         cleaned: list[str] = []
         for url in urls:
-            parsed = urlparse(url)
-            ext = os.path.splitext(parsed.path)[1].lower()
-            if self.filter_extensions and ext in SKIP_EXTENSIONS:
+            try:
+                parsed = urlparse(url)
+                if not parsed.scheme or not parsed.netloc:
+                    continue
+                ext = os.path.splitext(parsed.path)[1].lower()
+                if self.filter_extensions and ext in SKIP_EXTENSIONS:
+                    continue
+                if not parsed.query:
+                    continue
+                # Replace all param values with placeholder
+                pairs = parse_qsl(parsed.query, keep_blank_values=True)
+                new_query = "&".join(f"{k}={self.placeholder}" for k, _ in pairs)
+                clean = urlunparse(parsed._replace(query=new_query))
+                if clean not in seen:
+                    seen.add(clean)
+                    cleaned.append(clean)
+            except Exception:
                 continue
-            if not parsed.query:
-                continue
-            # Replace all param values with placeholder
-            pairs = parse_qsl(parsed.query, keep_blank_values=True)
-            new_query = "&".join(f"{k}={self.placeholder}" for k, _ in pairs)
-            clean = urlunparse(parsed._replace(query=new_query))
-            if clean not in seen:
-                seen.add(clean)
-                cleaned.append(clean)
         return cleaned
 
-    def extract_parameters(self, urls: list[str]) -> set[DiscoveredParameter]:
+    def extract_parameters(self, urls: list[str], source_name: str) -> set[DiscoveredParameter]:
         params: set[DiscoveredParameter] = set()
         for url in urls:
-            parsed = urlparse(url)
-            for key, _ in parse_qsl(parsed.query, keep_blank_values=True):
-                params.add(DiscoveredParameter(name=key, source="wayback", url=url))
+            try:
+                parsed = urlparse(url)
+                for key, _ in parse_qsl(parsed.query, keep_blank_values=True):
+                    params.add(DiscoveredParameter(name=key, source=source_name, url=url))
+            except Exception:
+                continue
         return params
+
+class WaybackMiner(BaseMiner):
+    """Query the Wayback Machine CDX API."""
+    CDX_URL = "https://web.archive.org/cdx/search/cdx"
+
+    def mine(self, domain: str) -> list[str]:
+        # Use wildcard to find subdomains
+        query_url = f"*.{domain}" if not domain.startswith("*.") else domain
+        params = {
+            "url": f"{query_url}/*",
+            "output": "txt",
+            "collapse": "urlkey",
+            "fl": "original",
+        }
+        for attempt in range(3):  # 3 retries for 503/errors
+            try:
+                resp = requests.get(
+                    self.CDX_URL,
+                    params=params,
+                    timeout=self.timeout,
+                    proxies=self.proxies,
+                )
+                if resp.status_code == 503:
+                    time.sleep(2 * (attempt + 1))
+                    continue
+                resp.raise_for_status()
+                raw = [line.strip() for line in resp.text.splitlines() if line.strip()]
+                return self._clean_urls(raw)
+            except Exception:
+                if attempt == 2: break
+                time.sleep(1)
+        return []
+
+class OTXMiner(BaseMiner):
+    """Query AlienVault OTX URL list."""
+    API_URL = "https://otx.alienvault.com/api/v1/indicators/domain/{domain}/url_list"
+
+    def mine(self, domain: str) -> list[str]:
+        url = self.API_URL.format(domain=domain)
+        params = {"limit": 500, "page": 1}
+        try:
+            resp = requests.get(
+                url,
+                params=params,
+                timeout=self.timeout,
+                proxies=self.proxies,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            raw = [item["url"] for item in data.get("url_list", []) if "url" in item]
+            return self._clean_urls(raw)
+        except Exception:
+            return []
+
+class CommonCrawlMiner(BaseMiner):
+    """Query Common Crawl index."""
+    INDEX_URL = "https://index.commoncrawl.org/collinfo.json"
+
+    def mine(self, domain: str) -> list[str]:
+        try:
+            # Get latest index
+            resp = requests.get(self.INDEX_URL, timeout=self.timeout, proxies=self.proxies)
+            resp.raise_for_status()
+            latest_index = resp.json()[0]["cdx-api"]
+            
+            query_url = f"*.{domain}"
+            params = {
+                "url": query_url,
+                "output": "json",
+                "fl": "url",
+            }
+            resp = requests.get(latest_index, params=params, timeout=self.timeout, proxies=self.proxies)
+            if resp.status_code != 200:
+                return []
+            
+            raw = []
+            for line in resp.text.splitlines():
+                try:
+                    item = json.loads(line)
+                    if "url" in item:
+                        raw.append(item["url"])
+                except Exception:
+                    continue
+            return self._clean_urls(raw)
+        except Exception:
+            return []
+
+class MultiSourceMiner:
+    """Orchestrates multiple passive sources in parallel."""
+    def __init__(self, **kwargs):
+        self.miners = [
+            WaybackMiner(**kwargs),
+            OTXMiner(**kwargs),
+            CommonCrawlMiner(**kwargs),
+        ]
+
+    def mine_all(self, domain: str) -> tuple[list[str], set[DiscoveredParameter]]:
+        all_urls = set()
+        all_params = set()
+        
+        import concurrent.futures as _futures
+        with _futures.ThreadPoolExecutor(max_workers=len(self.miners)) as executor:
+            future_to_miner = {executor.submit(m.mine, domain): m for m in self.miners}
+            for future in _futures.as_completed(future_to_miner):
+                miner = future_to_miner[future]
+                source_name = miner.__class__.__name__.replace("Miner", "").lower()
+                try:
+                    urls = future.result()
+                    all_urls.update(urls)
+                    all_params.update(miner.extract_parameters(urls, source_name))
+                except Exception:
+                    continue
+        
+        return sorted(list(all_urls)), all_params
 
 
 # ---------------------------------------------------------------------------

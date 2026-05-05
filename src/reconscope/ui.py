@@ -23,7 +23,7 @@ BANNER = r"""
 |  _ <  __/ (_| (_) | | | | ___) | (_| (_) | |_) |  __/
 |_| \_\___|\___\___/|_| |_||____/ \___\___/| .__/ \___|
                                             |_|[/bold cyan]
-[dim]  v2.0  |  Endpoint & Parameter Enumeration  |  by Mangesh Phulari[/dim]
+[dim]  v3.0  |  Multi-Source Passive & Active Recon  |  by Mangesh Phulari[/dim]
 """
 
 
@@ -67,7 +67,7 @@ def print_results(
         _print_parameters(result)
 
     if result.wayback_urls:
-        _print_wayback(result)
+        _print_passive(result)
 
     _print_summary_table(result)
 
@@ -93,8 +93,8 @@ def _print_parameters(result: "ReconResult") -> None:
     console.print()
 
 
-def _print_wayback(result: "ReconResult") -> None:
-    console.print(f"[bold green]Wayback URLs[/bold green] — [dim]{len(result.wayback_urls)} found[/dim]")
+def _print_passive(result: "ReconResult") -> None:
+    console.print(f"[bold green]Passive URLs[/bold green] — [dim]{len(result.wayback_urls)} found[/dim]")
     for url in sorted(result.wayback_urls):
         console.print(f"  [green]{url}[/green]")
     console.print()
@@ -107,6 +107,6 @@ def _print_summary_table(result: "ReconResult") -> None:
     table.add_row("Pages visited", str(len(result.visited_pages)))
     table.add_row("Endpoints", str(len(result.endpoints)))
     table.add_row("Parameters", str(len(result.parameters)))
-    table.add_row("Wayback URLs", str(len(result.wayback_urls)))
+    table.add_row("Passive URLs", str(len(result.wayback_urls)))
     console.print(table)
     console.print()

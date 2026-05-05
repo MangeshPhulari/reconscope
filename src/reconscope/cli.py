@@ -4,14 +4,14 @@ import sys
 from argparse import ArgumentParser
 from pathlib import Path
 
-from .core import ReconScope, WaybackMiner
+from .core import ReconScope, MultiSourceMiner
 from .ui import console, make_progress, print_banner, print_results
 
 
 def build_parser() -> ArgumentParser:
     parser = ArgumentParser(
         prog="reconscope",
-        description="Authorized endpoint & parameter enumeration — v2.0",
+        description="Advanced Parameter & Endpoint Enumeration — v3.0",
         epilog="Use only on systems you own or have explicit permission to assess.",
     )
 
@@ -22,17 +22,18 @@ def build_parser() -> ArgumentParser:
     # --- Crawl behaviour ---
     parser.add_argument("--max-depth", type=int, default=2, help="Maximum crawl depth (default: 2)")
     parser.add_argument("--max-pages", type=int, default=250, help="Maximum pages per target (default: 250)")
-    parser.add_argument("--concurrency", type=int, default=8, help="Concurrent fetches (default: 8)")
-    parser.add_argument("--timeout", type=float, default=10.0, help="Request timeout in seconds (default: 10)")
+    parser.add_argument("--concurrency", type=int, default=10, help="Concurrent fetches (default: 10)")
+    parser.add_argument("--timeout", type=float, default=15.0, help="Request timeout in seconds (default: 15)")
     parser.add_argument("--delay", type=float, default=0.0, help="Delay between requests in seconds (default: 0)")
-    parser.add_argument("--no-crawl", action="store_true", help="Skip live crawl; Wayback-only mode")
+    parser.add_argument("--no-crawl", action="store_true", help="Skip live crawl; Passive-only mode")
     parser.add_argument("--allow-subdomains", action="store_true", help="Allow subdomains within scope")
     parser.add_argument("--allow-external", action="store_true", help="Allow external hosts")
     parser.add_argument("--insecure", action="store_true", help="Disable TLS certificate verification")
     parser.add_argument("--no-filter-extensions", action="store_true", help="Disable static asset filtering")
 
-    # --- Wayback Machine ---
-    parser.add_argument("--wayback", "-w", action="store_true", help="Enable Wayback Machine parameter mining")
+    # --- Passive Sources ---
+    parser.add_argument("--wayback", "-w", action="store_true", help="Enable multi-source passive mining (Wayback, OTX, etc.)")
+    parser.add_argument("--no-passive", action="store_true", help="Disable all passive mining")
 
     # --- Request customisation ---
     parser.add_argument("--proxy", help="Proxy URL (e.g. http://127.0.0.1:8080)")
@@ -41,6 +42,7 @@ def build_parser() -> ArgumentParser:
         help="Extra request header (repeatable)"
     )
     parser.add_argument("--user-agent", help="Override User-Agent (default: random rotation)")
+    parser.add_argument("--threads", type=int, default=10, dest="concurrency", help="Alias for concurrency")
 
     # --- Output ---
     parser.add_argument("--output", "-o", choices=("text", "json", "csv"), default="text", help="Output format")
@@ -76,7 +78,7 @@ def parse_headers(header_list: list[str] | None) -> dict[str, str]:
     return result
 
 
-def _save_wayback_file(domain: str, urls: list[str], out_dir: Path) -> Path:
+def _save_passive_file(domain: str, urls: list[str], out_dir: Path) -> Path:
     """Save FUZZ-parameterised URLs to results/domain.txt and return the path."""
     out_dir.mkdir(parents=True, exist_ok=True)
     out_file = out_dir / f"{domain}.txt"
@@ -99,29 +101,34 @@ def main(argv: list[str] | None = None) -> int:
     placeholder = args.placeholder  # default "FUZZ"
 
     # ------------------------------------------------------------------ #
-    # Wayback Machine mining                                               #
+    # Multi-Source Passive Mining                                          #
     # ------------------------------------------------------------------ #
-    wayback_results: dict[str, list[str]] = {}
-    miner: WaybackMiner | None = None
+    passive_results: dict[str, list[str]] = {}
+    passive_params: dict[str, set] = {}
+    miner: MultiSourceMiner | None = None
 
-    if args.wayback:
-        miner = WaybackMiner(
+    # In v3, --wayback is an alias for all passive sources unless --no-passive is used
+    if (args.wayback or not args.no_passive) and not args.no_passive:
+        miner = MultiSourceMiner(
             placeholder=placeholder,
             proxies={"http": args.proxy, "https": args.proxy} if args.proxy else {},
             filter_extensions=filter_ext,
+            timeout=args.timeout,
         )
 
         # Determine output directory (default: ./results/)
         out_dir = args.output_dir or Path("results")
 
         for target in targets:
+            # Clean domain for mining
             domain = target.replace("https://", "").replace("http://", "").split("/")[0]
 
             if not args.silent:
-                console.print(f"\n[bold green][Wayback][/bold green] Mining [cyan]{domain}[/cyan] from archive.org ...")
+                console.print(f"\n[bold green][Passive][/bold green] Mining [cyan]{domain}[/cyan] from multiple sources...")
 
-            urls = miner.mine(domain)
-            wayback_results[target] = urls
+            urls, params = miner.mine_all(domain)
+            passive_results[target] = urls
+            passive_params[target] = params
 
             if not urls:
                 if not args.silent:
@@ -129,32 +136,34 @@ def main(argv: list[str] | None = None) -> int:
                 continue
 
             if not args.silent:
-                console.print(f"  [green]✔  {len(urls)}[/green] parameterised URLs discovered")
+                console.print(f"  [green]✔  {len(urls)}[/green] parameterised URLs discovered across all sources")
 
             # Always auto-save to results/domain.txt unless --output-file was given
             if not args.output_file:
-                saved = _save_wayback_file(domain, urls, out_dir)
+                saved = _save_passive_file(domain, urls, out_dir)
                 if not args.silent:
                     console.print(f"  [bold cyan]Saved →[/bold cyan] {saved}")
 
-            # Always print the FUZZ URLs to stdout (they're the main deliverable)
-            if not args.output_file:
+            # Always print the FUZZ URLs to stdout
+            if not args.output_file and not args.silent:
+                sys.stdout.write("\n".join(urls[:10]) + (f"\n... and {len(urls)-10} more\n" if len(urls) > 10 else "\n"))
+            elif not args.output_file:
                 sys.stdout.write("\n".join(urls) + "\n")
 
     # ------------------------------------------------------------------ #
-    # No-crawl mode: Wayback-only, skip live HTTP crawl                   #
+    # No-crawl mode: Passive-only, skip live HTTP crawl                   #
     # ------------------------------------------------------------------ #
     if args.no_crawl:
-        if not args.wayback:
-            parser.error("--no-crawl requires --wayback (nothing to do otherwise)")
+        if args.no_passive:
+            parser.error("--no-crawl requires passive mining unless you provide targets for crawling")
 
-        # Build a skeleton ReconResult from Wayback data
+        # Build a skeleton ReconResult from passive data
         from .core import ReconResult
         result = ReconResult(target=";".join(targets))
-        for target, urls in wayback_results.items():
+        for target, urls in passive_results.items():
             result.wayback_urls.extend(urls)
-            if miner and urls:
-                for p in miner.extract_parameters(urls):
+            if target in passive_params:
+                for p in passive_params[target]:
                     key = f"{p.name}|{p.source}|{p.url or ''}"
                     result.parameters.setdefault(key, p)
 
@@ -168,7 +177,7 @@ def main(argv: list[str] | None = None) -> int:
         if not args.silent:
             console.print(
                 f"\n[bold]Summary:[/bold] "
-                f"[green]{len(result.wayback_urls)}[/green] Wayback URLs  |  "
+                f"[green]{len(result.wayback_urls)}[/green] Passive URLs  |  "
                 f"[yellow]{len(result.parameters)}[/yellow] unique parameters"
             )
         return 0
@@ -204,11 +213,11 @@ def main(argv: list[str] | None = None) -> int:
         result = engine.run(targets)
         progress.update(task, completed=args.max_pages * len(targets))
 
-    # Attach Wayback URLs to crawl result
-    for target, urls in wayback_results.items():
+    # Attach passive URLs to crawl result
+    for target, urls in passive_results.items():
         result.wayback_urls.extend(u for u in urls if u not in result.wayback_urls)
-        if miner and urls:
-            for p in miner.extract_parameters(urls):
+        if target in passive_params:
+            for p in passive_params[target]:
                 key = f"{p.name}|{p.source}|{p.url or ''}"
                 result.parameters.setdefault(key, p)
 
