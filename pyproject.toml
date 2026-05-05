@@ -4,18 +4,22 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "reconscope"
-version = "0.1.0"
+version = "2.0.0"
 description = "Authorized endpoint and parameter enumeration for owned targets"
 readme = "README.md"
 requires-python = ">=3.11"
-authors = [{ name = "Copilot" }]
+authors = [{ name = "Mangesh Phulari" }]
 license = { text = "MIT" }
-keywords = ["recon", "crawler", "security", "enumeration"]
+keywords = ["recon", "crawler", "security", "enumeration", "paramspider", "hakrawler"]
 classifiers = [
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3 :: Only",
   "License :: OSI Approved :: MIT License",
   "Operating System :: OS Independent",
+]
+dependencies = [
+  "requests>=2.31",
+  "rich>=13.0",
 ]
 
 [project.scripts]

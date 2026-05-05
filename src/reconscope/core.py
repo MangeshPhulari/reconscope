@@ -1,24 +1,72 @@
 from __future__ import annotations
 
+import csv
+import json
+import os
+import random
+import re
+import ssl
+import time
+from collections import deque
 from dataclasses import dataclass, field
 from html.parser import HTMLParser
 from pathlib import Path
-from urllib.error import HTTPError, URLError
-from urllib.parse import parse_qsl, urljoin, urlparse, urlunparse
-from urllib.request import Request, urlopen
-import concurrent.futures as futures
-import csv
-import json
-import re
-import ssl
-from collections import deque
 from typing import Iterable
+from urllib.parse import parse_qsl, urljoin, urlparse, urlunparse
 
-DEFAULT_USER_AGENT = "ReconScope/0.1"
+import requests
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+DEFAULT_USER_AGENT = "ReconScope/2.0"
+
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_4) AppleWebKit/605.1.15 Safari/605.1.15",
+    "Mozilla/5.0 (X11; Linux x86_64; rv:125.0) Gecko/20100101 Firefox/125.0",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:124.0) Gecko/20100101 Firefox/124.0",
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 Mobile/15E148 Safari/604.1",
+    "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 Chrome/124.0 Mobile Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Edg/124.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_4) AppleWebKit/537.36 Chrome/124.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:124.0) Gecko/20100101 Firefox/124.0",
+    "curl/8.7.1",
+]
+
+SKIP_EXTENSIONS = {
+    ".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".svg", ".ico",
+    ".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx",
+    ".mp4", ".mp3", ".avi", ".mov", ".mkv", ".webm",
+    ".css", ".woff", ".woff2", ".eot", ".ttf", ".otf",
+    ".zip", ".tar", ".gz", ".rar", ".7z",
+}
+
+# URL / parameter / JS-endpoint regexes
 URL_RE = re.compile(r"(?P<url>(?:https?:)?//[A-Za-z0-9._~:/?#\[\]@!$&'()*+,;=%-]+|/[A-Za-z0-9._~:/?#\[\]@!$&'()*+,;=%-]+)")
 PARAM_RE = re.compile(r"(?:[?&]|\b)([A-Za-z_][A-Za-z0-9_\-]{1,60})=")
-JS_ENDPOINT_RE = re.compile(r"(?:['\"])((?:https?:)?//[^'\"\s]+|/[A-Za-z0-9._~:/?#\[\]@!$&'()*+,;=%-]+)(?:['\"])" )
 
+# Deep JS patterns (fetch, axios, XHR, $.ajax, template literals, Next.js)
+JS_PATTERNS = [
+    re.compile(r"""fetch\s*\(\s*['"`]([^'"`\s]+)['"`]"""),
+    re.compile(r"""axios\s*\.\s*(?:get|post|put|patch|delete)\s*\(\s*['"`]([^'"`\s]+)['"`]"""),
+    re.compile(r"""(?:open|send)\s*\(\s*['"`][A-Z]+['"`]\s*,\s*['"`]([^'"`\s]+)['"`]"""),
+    re.compile(r"""\$\.ajax\s*\(\s*\{[^}]*url\s*:\s*['"`]([^'"`\s]+)['"`]""", re.DOTALL),
+    re.compile(r"""url\s*:\s*['"`]([/][^'"`\s]+)['"`]"""),
+    re.compile(r"""['"`](/api/[^'"`\s]+)['"`]"""),
+    re.compile(r"""['"`](/v\d+/[^'"`\s]+)['"`]"""),
+    re.compile(r"""['"`](/rest/[^'"`\s]+)['"`]"""),
+    re.compile(r"""['"`](/graphql[^'"`\s]*)['"`]"""),
+    re.compile(r"""href\s*=\s*['"`]([^'"`\s]+)['"`]"""),
+    re.compile(r"""action\s*=\s*['"`]([^'"`\s]+)['"`]"""),
+    re.compile(r"""(?:https?:)?//[A-Za-z0-9._-]+/[A-Za-z0-9._~:/?#\[\]@!$&'()*+,;=%-]+"""),
+]
+
+
+# ---------------------------------------------------------------------------
+# Data models
+# ---------------------------------------------------------------------------
 
 @dataclass(frozen=True)
 class DiscoveredEndpoint:
@@ -52,13 +100,19 @@ class ReconResult:
     endpoints: dict[str, DiscoveredEndpoint] = field(default_factory=dict)
     parameters: dict[str, DiscoveredParameter] = field(default_factory=dict)
     pages: dict[str, PageRecord] = field(default_factory=dict)
+    wayback_urls: list[str] = field(default_factory=list)
 
     def merge(self, other: "ReconResult") -> None:
-        self.visited_pages.extend(page for page in other.visited_pages if page not in self.visited_pages)
+        self.visited_pages.extend(p for p in other.visited_pages if p not in self.visited_pages)
         self.endpoints.update(other.endpoints)
         self.parameters.update(other.parameters)
         self.pages.update(other.pages)
+        self.wayback_urls.extend(u for u in other.wayback_urls if u not in self.wayback_urls)
 
+
+# ---------------------------------------------------------------------------
+# HTML parser
+# ---------------------------------------------------------------------------
 
 class _HTMLDiscoveryParser(HTMLParser):
     def __init__(self) -> None:
@@ -104,6 +158,83 @@ class _HTMLDiscoveryParser(HTMLParser):
             self.text_chunks.append(data)
 
 
+# ---------------------------------------------------------------------------
+# Wayback Machine miner
+# ---------------------------------------------------------------------------
+
+class WaybackMiner:
+    """Query the Wayback Machine CDX API to harvest historical URLs with parameters."""
+
+    CDX_URL = "https://web.archive.org/cdx/search/cdx"
+
+    def __init__(
+        self,
+        placeholder: str = "FUZZ",
+        proxies: dict[str, str] | None = None,
+        timeout: float = 20.0,
+        filter_extensions: bool = True,
+    ) -> None:
+        self.placeholder = placeholder
+        self.proxies = proxies or {}
+        self.timeout = timeout
+        self.filter_extensions = filter_extensions
+
+    def mine(self, domain: str) -> list[str]:
+        """Return a deduplicated list of cleaned URLs (params replaced with placeholder)."""
+        raw = self._fetch_cdx(domain)
+        return self._clean_urls(raw)
+
+    def _fetch_cdx(self, domain: str) -> list[str]:
+        params = {
+            "url": f"{domain}/*",
+            "output": "txt",
+            "collapse": "urlkey",
+            "fl": "original",
+        }
+        try:
+            resp = requests.get(
+                self.CDX_URL,
+                params=params,
+                timeout=self.timeout,
+                proxies=self.proxies,
+            )
+            resp.raise_for_status()
+            return [line.strip() for line in resp.text.splitlines() if line.strip()]
+        except Exception:
+            return []
+
+    def _clean_urls(self, urls: list[str]) -> list[str]:
+        seen: set[str] = set()
+        cleaned: list[str] = []
+        for url in urls:
+            parsed = urlparse(url)
+            ext = os.path.splitext(parsed.path)[1].lower()
+            if self.filter_extensions and ext in SKIP_EXTENSIONS:
+                continue
+            if not parsed.query:
+                continue
+            # Replace all param values with placeholder
+            pairs = parse_qsl(parsed.query, keep_blank_values=True)
+            new_query = "&".join(f"{k}={self.placeholder}" for k, _ in pairs)
+            clean = urlunparse(parsed._replace(query=new_query))
+            if clean not in seen:
+                seen.add(clean)
+                cleaned.append(clean)
+        return cleaned
+
+    def extract_parameters(self, urls: list[str]) -> set[DiscoveredParameter]:
+        params: set[DiscoveredParameter] = set()
+        for url in urls:
+            parsed = urlparse(url)
+            for key, _ in parse_qsl(parsed.query, keep_blank_values=True):
+                params.add(DiscoveredParameter(name=key, source="wayback", url=url))
+        return params
+
+
+# ---------------------------------------------------------------------------
+# Main engine
+# ---------------------------------------------------------------------------
+
 class ReconScope:
     def __init__(
         self,
@@ -112,19 +243,48 @@ class ReconScope:
         max_pages: int = 250,
         concurrency: int = 8,
         timeout: float = 10.0,
-        user_agent: str = DEFAULT_USER_AGENT,
+        user_agent: str | None = None,
+        rotate_ua: bool = True,
         allow_subdomains: bool = False,
         allow_external: bool = False,
         verify_ssl: bool = True,
+        proxy: str | None = None,
+        delay: float = 0.0,
+        extra_headers: dict[str, str] | None = None,
+        filter_extensions: bool = True,
+        placeholder: str | None = None,
+        progress_callback=None,
     ) -> None:
         self.max_depth = max_depth
         self.max_pages = max_pages
         self.concurrency = max(1, concurrency)
         self.timeout = timeout
         self.user_agent = user_agent
+        self.rotate_ua = rotate_ua
         self.allow_subdomains = allow_subdomains
         self.allow_external = allow_external
         self.verify_ssl = verify_ssl
+        self.proxies = {"http": proxy, "https": proxy} if proxy else {}
+        self.delay = delay
+        self.extra_headers = extra_headers or {}
+        self.filter_extensions = filter_extensions
+        self.placeholder = placeholder
+        self.progress_callback = progress_callback  # called with (visited, max_pages)
+        self._session = self._make_session()
+
+    def _make_session(self) -> requests.Session:
+        s = requests.Session()
+        s.verify = self.verify_ssl
+        if self.proxies:
+            s.proxies.update(self.proxies)
+        return s
+
+    def _pick_ua(self) -> str:
+        if self.user_agent:
+            return self.user_agent
+        if self.rotate_ua:
+            return random.choice(USER_AGENTS)
+        return DEFAULT_USER_AGENT
 
     def run(self, targets: Iterable[str]) -> ReconResult:
         aggregate = ReconResult(target=";".join(targets))
@@ -138,7 +298,6 @@ class ReconScope:
         result = ReconResult(target=target)
         queue: deque[tuple[str, int]] = deque([(urlunparse(normalized), 0)])
         seen: set[str] = set()
-        ssl_context = None if self.verify_ssl else ssl._create_unverified_context()
 
         while queue and len(result.visited_pages) < self.max_pages:
             batch: list[tuple[str, int]] = []
@@ -154,25 +313,32 @@ class ReconScope:
             if not batch:
                 continue
 
-            with futures.ThreadPoolExecutor(max_workers=self.concurrency) as executor:
+            import concurrent.futures as _futures
+            with _futures.ThreadPoolExecutor(max_workers=self.concurrency) as executor:
                 future_map = {
-                    executor.submit(self._fetch_and_extract, url, ssl_context): (url, depth)
+                    executor.submit(self._fetch_and_extract, url): (url, depth)
                     for url, depth in batch
                 }
-                for future in futures.as_completed(future_map):
+                for future in _futures.as_completed(future_map):
                     url, depth = future_map[future]
-                    page, discovered = future.result()
+                    page, bundle = future.result()
                     result.visited_pages.append(url)
                     result.pages[url] = page
-                    for endpoint in discovered.endpoints:
+                    for endpoint in bundle.endpoints:
                         result.endpoints.setdefault(endpoint.url, endpoint)
-                    for parameter in discovered.parameters:
+                    for parameter in bundle.parameters:
                         key = f"{parameter.name}|{parameter.source}|{parameter.url or ''}"
                         result.parameters.setdefault(key, parameter)
                     if depth < self.max_depth:
-                        for candidate in discovered.urls:
+                        for candidate in bundle.urls:
                             if candidate not in seen and self._is_allowed(candidate, allowed_hosts):
                                 queue.append((candidate, depth + 1))
+
+                    if self.progress_callback:
+                        self.progress_callback(len(result.visited_pages), self.max_pages)
+
+                    if self.delay > 0:
+                        time.sleep(self.delay)
 
         return result
 
@@ -182,15 +348,15 @@ class ReconScope:
         endpoints: set[DiscoveredEndpoint] = field(default_factory=set)
         parameters: set[DiscoveredParameter] = field(default_factory=set)
 
-    def _fetch_and_extract(self, url: str, ssl_context: ssl.SSLContext | None) -> tuple[PageRecord, "ReconScope._ExtractionBundle"]:
-        page = self._fetch(url, ssl_context)
+    def _fetch_and_extract(self, url: str) -> tuple[PageRecord, "_ExtractionBundle"]:
+        page_data = self._fetch(url)
         bundle = self._ExtractionBundle()
-        if not page:
+        if not page_data:
             return PageRecord(url=url, status_code=None, content_type=None, title=None, source="fetch-failed"), bundle
 
-        content = page["body"]
-        content_type = page["content_type"]
-        status_code = page["status_code"]
+        content = page_data["body"]
+        content_type = page_data["content_type"]
+        status_code = page_data["status_code"]
         title = None
         parser = _HTMLDiscoveryParser()
 
@@ -201,23 +367,31 @@ class ReconScope:
                 pass
             title = parser.title
             for href, source in parser.links:
-                bundle.urls.add(self._resolve(url, href))
-                bundle.endpoints.add(DiscoveredEndpoint(url=self._resolve(url, href), source=source))
+                resolved = self._resolve(url, href)
+                if not self._skip_url(resolved):
+                    bundle.urls.add(resolved)
+                    bundle.endpoints.add(DiscoveredEndpoint(url=resolved, source=source))
             for script in parser.scripts:
-                bundle.urls.add(self._resolve(url, script))
-                bundle.endpoints.add(DiscoveredEndpoint(url=self._resolve(url, script), source="html:script[src]"))
+                resolved = self._resolve(url, script)
+                bundle.urls.add(resolved)
+                bundle.endpoints.add(DiscoveredEndpoint(url=resolved, source="html:script[src]"))
             for action, method in parser.forms:
                 if action:
                     resolved = self._resolve(url, action)
-                    bundle.endpoints.add(DiscoveredEndpoint(url=resolved, source=f"html:form[{method}]") )
+                    bundle.endpoints.add(DiscoveredEndpoint(url=resolved, source=f"html:form[{method}]"))
                     bundle.urls.add(resolved)
             for chunk in parser.text_chunks:
                 if chunk.startswith("__PARAM__"):
                     bundle.parameters.add(DiscoveredParameter(name=chunk.removeprefix("__PARAM__"), source="html:form-field", url=url))
 
-        bundle.urls.update(self._extract_urls_from_text(content, url))
-        bundle.endpoints.update(self._extract_endpoints_from_text(content, url))
+        # Deep JS extraction
+        bundle.endpoints.update(self._deep_js_extract(content, url))
+        bundle.urls.update(e.url for e in bundle.endpoints)
         bundle.parameters.update(self._extract_parameters_from_text(content, url))
+
+        # Apply placeholder to outgoing URLs if requested
+        if self.placeholder:
+            bundle.endpoints = {self._fuzz_endpoint(e) for e in bundle.endpoints}
 
         for endpoint in list(bundle.endpoints):
             bundle.urls.add(endpoint.url)
@@ -229,74 +403,88 @@ class ReconScope:
             title=title,
             source="html" if "html" in content_type else "text",
             discovered_urls=set(bundle.urls),
-            endpoints={endpoint.url for endpoint in bundle.endpoints},
-            parameters={parameter.name for parameter in bundle.parameters},
+            endpoints={ep.url for ep in bundle.endpoints},
+            parameters={p.name for p in bundle.parameters},
         )
         return page_record, bundle
 
-    def _fetch(self, url: str, ssl_context: ssl.SSLContext | None) -> dict[str, str | int] | None:
-        headers = {"User-Agent": self.user_agent, "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"}
-        request = Request(url, headers=headers)
+    def _fetch(self, url: str) -> dict[str, str | int] | None:
+        headers = {
+            "User-Agent": self._pick_ua(),
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            **self.extra_headers,
+        }
         try:
-            with urlopen(request, timeout=self.timeout, context=ssl_context) as response:
-                body_bytes = response.read()
-                content_type = response.headers.get_content_type()
-                charset = response.headers.get_content_charset() or "utf-8"
-                body = body_bytes.decode(charset, errors="replace")
-                status_code = getattr(response, "status", 200)
-                return {"body": body, "content_type": content_type, "status_code": status_code}
-        except (HTTPError, URLError, TimeoutError, UnicodeError):
+            resp = self._session.get(url, headers=headers, timeout=self.timeout, allow_redirects=True)
+            content_type = resp.headers.get("Content-Type", "text/html").split(";")[0].strip()
+            charset = resp.apparent_encoding or "utf-8"
+            body = resp.content.decode(charset, errors="replace")
+            return {"body": body, "content_type": content_type, "status_code": resp.status_code}
+        except Exception:
             return None
 
-    def _extract_urls_from_text(self, text: str, base_url: str) -> set[str]:
-        results: set[str] = set()
-        for match in URL_RE.finditer(text):
-            results.add(self._resolve(base_url, match.group("url")))
-        return results
+    # ------------------------------------------------------------------
+    # Deep JS endpoint extraction
+    # ------------------------------------------------------------------
 
-    def _extract_endpoints_from_text(self, text: str, base_url: str) -> set[DiscoveredEndpoint]:
+    def _deep_js_extract(self, text: str, base_url: str) -> set[DiscoveredEndpoint]:
         endpoints: set[DiscoveredEndpoint] = set()
-        for match in URL_RE.finditer(text):
-            candidate = self._resolve(base_url, match.group("url"))
-            endpoints.add(DiscoveredEndpoint(url=candidate, source="text:url"))
-        for match in JS_ENDPOINT_RE.finditer(text):
-            candidate = self._resolve(base_url, match.group(1))
-            endpoints.add(DiscoveredEndpoint(url=candidate, source="js:string"))
+        for pattern in JS_PATTERNS:
+            for match in pattern.finditer(text):
+                candidate = match.group(1) if match.lastindex else match.group(0)
+                candidate = candidate.strip("'\"` \t\n\r")
+                if not candidate or len(candidate) > 512:
+                    continue
+                resolved = self._resolve(base_url, candidate)
+                if resolved.startswith("http"):
+                    endpoints.add(DiscoveredEndpoint(url=resolved, source="js:deep"))
         return endpoints
+
+    # ------------------------------------------------------------------
+    # Parameter extraction
+    # ------------------------------------------------------------------
 
     def _extract_parameters_from_text(self, text: str, base_url: str) -> set[DiscoveredParameter]:
         parameters: set[DiscoveredParameter] = set()
         for match in PARAM_RE.finditer(text):
             parameters.add(DiscoveredParameter(name=match.group(1), source="text", url=base_url))
-        for candidate in self._extract_urls_from_text(text, base_url):
+        for match in URL_RE.finditer(text):
+            candidate = self._resolve(base_url, match.group("url"))
             for key, _ in parse_qsl(urlparse(candidate).query, keep_blank_values=True):
                 parameters.add(DiscoveredParameter(name=key, source="url-query", url=candidate))
         return parameters
 
+    # ------------------------------------------------------------------
+    # URL helpers
+    # ------------------------------------------------------------------
+
     def _resolve(self, base_url: str, candidate: str) -> str:
         return self._canonicalize(urlparse(urljoin(base_url, candidate)))
 
-    def _normalize_target(self, target: str) -> str:
+    def _normalize_target(self, target: str) -> urlparse:
         if "//" not in target:
             target = f"https://{target}"
         parsed = urlparse(target)
         if not parsed.netloc:
             raise ValueError(f"Invalid target: {target}")
-        return self._canonicalize(parsed)
+        return self._canonicalize_parsed(parsed)
 
     def _canonicalize(self, parsed) -> str:
+        return urlunparse(self._canonicalize_parsed(parsed))
+
+    def _canonicalize_parsed(self, parsed):
         scheme = parsed.scheme or "https"
         netloc = parsed.netloc.lower()
         path = parsed.path or "/"
         if path != "/" and path.endswith("/"):
             path = path.rstrip("/")
-        query = parsed.query
-        fragment = ""
-        return urlunparse((scheme, netloc, path, "", query, fragment))
+        return parsed._replace(scheme=scheme, netloc=netloc, path=path, fragment="")
 
     def _is_allowed(self, url: str, allowed_hosts: set[str]) -> bool:
         parsed = urlparse(url)
         host = parsed.netloc.lower()
+        if not host:
+            return False
         if self.allow_external:
             return True
         if host in allowed_hosts:
@@ -305,12 +493,32 @@ class ReconScope:
             return any(host == allowed or host.endswith(f".{allowed}") for allowed in allowed_hosts)
         return False
 
+    def _skip_url(self, url: str) -> bool:
+        if not self.filter_extensions:
+            return False
+        ext = os.path.splitext(urlparse(url).path)[1].lower()
+        return ext in SKIP_EXTENSIONS
+
+    def _fuzz_endpoint(self, ep: DiscoveredEndpoint) -> DiscoveredEndpoint:
+        parsed = urlparse(ep.url)
+        if not parsed.query:
+            return ep
+        pairs = parse_qsl(parsed.query, keep_blank_values=True)
+        new_query = "&".join(f"{k}={self.placeholder}" for k, _ in pairs)
+        new_url = urlunparse(parsed._replace(query=new_query))
+        return DiscoveredEndpoint(url=new_url, source=ep.source)
+
+    # ------------------------------------------------------------------
+    # Export helpers
+    # ------------------------------------------------------------------
+
     def export_json(self, result: ReconResult) -> str:
         payload = {
             "target": result.target,
             "visited_pages": result.visited_pages,
-            "endpoints": [endpoint.__dict__ for endpoint in result.endpoints.values()],
-            "parameters": [parameter.__dict__ for parameter in result.parameters.values()],
+            "wayback_urls": result.wayback_urls,
+            "endpoints": [ep.__dict__ for ep in result.endpoints.values()],
+            "parameters": [p.__dict__ for p in result.parameters.values()],
             "pages": [
                 {
                     "url": page.url,
@@ -328,30 +536,51 @@ class ReconScope:
         return json.dumps(payload, indent=2, sort_keys=True)
 
     def export_csv(self, result: ReconResult) -> str:
-        lines: list[str] = []
-        rows = [
-            ("type", "value", "source", "url"),
-        ]
-        rows.extend(("endpoint", endpoint.url, endpoint.source, "") for endpoint in result.endpoints.values())
-        rows.extend(("parameter", parameter.name, parameter.source, parameter.url or "") for parameter in result.parameters.values())
-        buffer = []
-        writer = csv.writer(buffer := _CSVBuffer())
+        rows = [("type", "value", "source", "url")]
+        rows.extend(("endpoint", ep.url, ep.source, "") for ep in result.endpoints.values())
+        rows.extend(("parameter", p.name, p.source, p.url or "") for p in result.parameters.values())
+        rows.extend(("wayback", url, "wayback", "") for url in result.wayback_urls)
+        buffer = _CSVBuffer()
+        writer = csv.writer(buffer)
         for row in rows:
             writer.writerow(row)
         return buffer.getvalue()
 
     def export_text(self, result: ReconResult) -> str:
         lines = [f"Target: {result.target}", "", "Endpoints:"]
-        for endpoint in sorted(result.endpoints.values(), key=lambda item: item.url):
-            lines.append(f"- {endpoint.url} [{endpoint.source}]")
-        lines.append("")
-        lines.append("Parameters:")
-        for parameter in sorted(result.parameters.values(), key=lambda item: item.name):
-            suffix = f" ({parameter.url})" if parameter.url else ""
-            lines.append(f"- {parameter.name} [{parameter.source}]{suffix}")
-        lines.append("")
-        lines.append(f"Visited pages: {len(result.visited_pages)}")
+        for ep in sorted(result.endpoints.values(), key=lambda e: e.url):
+            lines.append(f"  {ep.url}  [{ep.source}]")
+        lines += ["", "Parameters:"]
+        for p in sorted(result.parameters.values(), key=lambda x: x.name):
+            suffix = f"  ({p.url})" if p.url else ""
+            lines.append(f"  {p.name}  [{p.source}]{suffix}")
+        if result.wayback_urls:
+            lines += ["", "Wayback URLs:"]
+            for url in sorted(result.wayback_urls):
+                lines.append(f"  {url}")
+        lines += ["", f"Visited pages: {len(result.visited_pages)}"]
         return "\n".join(lines)
+
+    def export_params_only(self, result: ReconResult) -> str:
+        names = sorted({p.name for p in result.parameters.values()})
+        return "\n".join(names)
+
+    def export_endpoints_only(self, result: ReconResult) -> str:
+        urls = sorted({ep.url for ep in result.endpoints.values()} | set(result.wayback_urls))
+        return "\n".join(urls)
+
+    def save_output_dir(self, result: ReconResult, out_dir: Path, fmt: str) -> None:
+        out_dir.mkdir(parents=True, exist_ok=True)
+        domain = result.target.replace("https://", "").replace("http://", "").split("/")[0]
+        fname = out_dir / f"{domain}.{fmt if fmt != 'text' else 'txt'}"
+        if fmt == "json":
+            content = self.export_json(result)
+        elif fmt == "csv":
+            content = self.export_csv(result)
+        else:
+            content = self.export_text(result)
+        fname.write_text(content, encoding="utf-8")
+        return fname
 
 
 class _CSVBuffer:
