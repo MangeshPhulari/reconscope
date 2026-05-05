@@ -23,7 +23,7 @@ BANNER = r"""
 |  _ <  __/ (_| (_) | | | | ___) | (_| (_) | |_) |  __/
 |_| \_\___|\___\___/|_| |_||____/ \___\___/| .__/ \___|
                                             |_|[/bold cyan]
-[dim]  v3.0  |  Multi-Source Passive & Active Recon  |  by Mangesh Phulari[/dim]
+[dim]  v4.0  |  Ultimate Pentest Edition (API, JS, Secrets)  |  by Mangesh Phulari[/dim]
 """
 
 
@@ -69,6 +69,9 @@ def print_results(
     if result.wayback_urls:
         _print_passive(result)
 
+    if result.secrets:
+        _print_secrets(result)
+
     _print_summary_table(result)
 
 
@@ -100,6 +103,13 @@ def _print_passive(result: "ReconResult") -> None:
     console.print()
 
 
+def _print_secrets(result: "ReconResult") -> None:
+    console.print(f"[bold red]Secrets Found[/bold red] — [dim]{len(result.secrets)} potential leaks[/dim]")
+    for s in result.secrets:
+        console.print(f"  [red]\\[{s.type}][/red] {s.value} [dim]({s.url})[/dim]")
+    console.print()
+
+
 def _print_summary_table(result: "ReconResult") -> None:
     table = Table(title="[bold]Scan Summary[/bold]", box=box.ROUNDED, show_header=True, header_style="bold magenta")
     table.add_column("Metric", style="dim")
@@ -108,5 +118,6 @@ def _print_summary_table(result: "ReconResult") -> None:
     table.add_row("Endpoints", str(len(result.endpoints)))
     table.add_row("Parameters", str(len(result.parameters)))
     table.add_row("Passive URLs", str(len(result.wayback_urls)))
+    table.add_row("Secrets", str(len(result.secrets)))
     console.print(table)
     console.print()

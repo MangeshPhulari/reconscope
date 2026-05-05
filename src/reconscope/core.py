@@ -63,6 +63,23 @@ JS_PATTERNS = [
     re.compile(r"""(?:https?:)?//[A-Za-z0-9._-]+/[A-Za-z0-9._~:/?#\[\]@!$&'()*+,;=%-]+"""),
 ]
 
+# API patterns & sensitive data regexes
+SECRET_PATTERNS = {
+    "AWS Access Key": re.compile(r"\b(?:AKIA|AGPA|AIDA|AROA|AIPA|ANPA|ANVA|ASIA)[A-Z0-9]{16}\b"),
+    "AWS Secret Key": re.compile(r"\b[A-Za-z0-9/+=]{40}\b"),
+    "Google API Key": re.compile(r"\bAIza[0-9A-Za-z\-_]{35}\b"),
+    "Firebase Key": re.compile(r"\bAIza[0-9A-Za-z\-_]{35}\b"),
+    "JWT Token": re.compile(r"\beyJ[A-Za-z0-9-_=]+\.[A-Za-z0-9-_=]+\.?[A-Za-z0-9-_.+/=]*\b"),
+    "Slack Token": re.compile(r"\bxox[baprs]-[0-9a-zA-Z]{10,48}\b"),
+    "GitHub Token": re.compile(r"\b(?:ghp|gho|ghu|ghs|ghr)_[a-zA-Z0-9]{36}\b"),
+}
+
+API_COMMON_PATHS = [
+    "/api/v1", "/api/v2", "/api", "/rest/v1", "/rest/v2", "/v1", "/v2",
+    "/swagger/v1/swagger.json", "/swagger.json", "/openapi.json", "/api-docs",
+    "/graphql", "/graphiql", "/docs", "/schema.graphql", "/v3", "/api/v3"
+]
+
 
 # ---------------------------------------------------------------------------
 # Data models
@@ -81,6 +98,13 @@ class DiscoveredParameter:
     url: str | None = None
 
 
+@dataclass(frozen=True)
+class DiscoveredSecret:
+    type: str
+    value: str
+    url: str
+
+
 @dataclass
 class PageRecord:
     url: str
@@ -91,6 +115,7 @@ class PageRecord:
     discovered_urls: set[str] = field(default_factory=set)
     endpoints: set[str] = field(default_factory=set)
     parameters: set[str] = field(default_factory=set)
+    secrets: list[DiscoveredSecret] = field(default_factory=list)
 
 
 @dataclass
@@ -101,6 +126,7 @@ class ReconResult:
     parameters: dict[str, DiscoveredParameter] = field(default_factory=dict)
     pages: dict[str, PageRecord] = field(default_factory=dict)
     wayback_urls: list[str] = field(default_factory=list)
+    secrets: list[DiscoveredSecret] = field(default_factory=list)
 
     def merge(self, other: "ReconResult") -> None:
         self.visited_pages.extend(p for p in other.visited_pages if p not in self.visited_pages)
@@ -108,6 +134,7 @@ class ReconResult:
         self.parameters.update(other.parameters)
         self.pages.update(other.pages)
         self.wayback_urls.extend(u for u in other.wayback_urls if u not in self.wayback_urls)
+        self.secrets.extend(s for s in other.secrets if s not in self.secrets)
 
 
 # ---------------------------------------------------------------------------
@@ -299,6 +326,20 @@ class CommonCrawlMiner(BaseMiner):
         except Exception:
             return []
 
+class HackerTargetMiner(BaseMiner):
+    """Query HackerTarget API for host links."""
+    API_URL = "https://api.hackertarget.com/pagelinks/?q={domain}"
+
+    def mine(self, domain: str) -> list[str]:
+        url = self.API_URL.format(domain=domain)
+        try:
+            resp = requests.get(url, timeout=self.timeout, proxies=self.proxies)
+            resp.raise_for_status()
+            raw = [line.strip() for line in resp.text.splitlines() if line.strip() and "http" in line]
+            return self._clean_urls(raw)
+        except Exception:
+            return []
+
 class MultiSourceMiner:
     """Orchestrates multiple passive sources in parallel."""
     def __init__(self, **kwargs):
@@ -306,6 +347,7 @@ class MultiSourceMiner:
             WaybackMiner(**kwargs),
             OTXMiner(**kwargs),
             CommonCrawlMiner(**kwargs),
+            HackerTargetMiner(**kwargs),
         ]
 
     def mine_all(self, domain: str) -> tuple[list[str], set[DiscoveredParameter]]:
@@ -486,6 +528,13 @@ class ReconScope:
         bundle.urls.update(e.url for e in bundle.endpoints)
         bundle.parameters.update(self._extract_parameters_from_text(content, url))
 
+        # Secret Scanning (V4)
+        secrets = self._scan_secrets(content, url)
+        
+        # API Discovery (V4)
+        if status_code == 200 and ("html" in content_type or url.endswith("/")):
+            bundle.endpoints.update(self._discover_apis(url))
+
         # Apply placeholder to outgoing URLs if requested
         if self.placeholder:
             bundle.endpoints = {self._fuzz_endpoint(e) for e in bundle.endpoints}
@@ -502,8 +551,26 @@ class ReconScope:
             discovered_urls=set(bundle.urls),
             endpoints={ep.url for ep in bundle.endpoints},
             parameters={p.name for p in bundle.parameters},
+            secrets=secrets,
         )
         return page_record, bundle
+
+    def _scan_secrets(self, text: str, url: str) -> list[DiscoveredSecret]:
+        discovered = []
+        for name, pattern in SECRET_PATTERNS.items():
+            for match in pattern.finditer(text):
+                discovered.append(DiscoveredSecret(type=name, value=match.group(0), url=url))
+        return discovered
+
+    def _discover_apis(self, base_url: str) -> set[DiscoveredEndpoint]:
+        endpoints = set()
+        parsed = urlparse(base_url)
+        origin = f"{parsed.scheme}://{parsed.netloc}"
+        
+        for path in API_COMMON_PATHS:
+            target = urljoin(origin, path)
+            endpoints.add(DiscoveredEndpoint(url=target, source="api:discovery"))
+        return endpoints
 
     def _fetch(self, url: str) -> dict[str, str | int] | None:
         headers = {
@@ -616,6 +683,7 @@ class ReconScope:
             "wayback_urls": result.wayback_urls,
             "endpoints": [ep.__dict__ for ep in result.endpoints.values()],
             "parameters": [p.__dict__ for p in result.parameters.values()],
+            "secrets": [s.__dict__ for s in result.secrets],
             "pages": [
                 {
                     "url": page.url,
@@ -626,6 +694,7 @@ class ReconScope:
                     "discovered_urls": sorted(page.discovered_urls),
                     "endpoints": sorted(page.endpoints),
                     "parameters": sorted(page.parameters),
+                    "secrets": [s.__dict__ for s in page.secrets],
                 }
                 for page in result.pages.values()
             ],
@@ -637,6 +706,7 @@ class ReconScope:
         rows.extend(("endpoint", ep.url, ep.source, "") for ep in result.endpoints.values())
         rows.extend(("parameter", p.name, p.source, p.url or "") for p in result.parameters.values())
         rows.extend(("wayback", url, "wayback", "") for url in result.wayback_urls)
+        rows.extend(("secret", s.value, s.type, s.url) for s in result.secrets)
         buffer = _CSVBuffer()
         writer = csv.writer(buffer)
         for row in rows:
@@ -651,8 +721,12 @@ class ReconScope:
         for p in sorted(result.parameters.values(), key=lambda x: x.name):
             suffix = f"  ({p.url})" if p.url else ""
             lines.append(f"  {p.name}  [{p.source}]{suffix}")
+        if result.secrets:
+            lines += ["", "Secrets Found:"]
+            for s in result.secrets:
+                lines.append(f"  [{s.type}] {s.value}  ({s.url})")
         if result.wayback_urls:
-            lines += ["", "Wayback URLs:"]
+            lines += ["", "Passive URLs:"]
             for url in sorted(result.wayback_urls):
                 lines.append(f"  {url}")
         lines += ["", f"Visited pages: {len(result.visited_pages)}"]

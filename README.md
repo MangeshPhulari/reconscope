@@ -11,8 +11,10 @@
 | Feature | Details |
 |---|---|
 | **Live crawler** | BFS crawl with concurrent fetches, HTML/JS/form parsing |
-| **Wayback Machine mining** | Harvests historical URLs with parameters from `web.archive.org` (opt-in via `--wayback`) |
+| **Passive Mining** | Wayback Machine, AlienVault OTX, Common Crawl, and HackerTarget |
 | **Deep JS extraction** | 12 regex patterns — `fetch()`, `axios`, `XMLHttpRequest`, `$.ajax`, `/api/`, `/v1/`, Next.js manifests |
+| **Deep API Discovery** | Automatic detection of Swagger, OpenAPI, and common API routes |
+| **Secret Detection** | Scan for AWS keys, Firebase, JWT, and other sensitive tokens |
 | **FUZZ placeholder** | Replaces all query-param values with `FUZZ` (or any string) for direct piping to ffuf/wfuzz |
 | **Proxy support** | Routes all requests through any HTTP/S proxy (e.g. Burp Suite) |
 | **Extension filtering** | Skips images, fonts, CSS, media — keeps noise low |
