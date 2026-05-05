@@ -25,7 +25,7 @@ def build_parser() -> ArgumentParser:
     parser.add_argument("--concurrency", type=int, default=8, help="Concurrent fetches (default: 8)")
     parser.add_argument("--timeout", type=float, default=10.0, help="Request timeout in seconds (default: 10)")
     parser.add_argument("--delay", type=float, default=0.0, help="Delay between requests in seconds (default: 0)")
-    parser.add_argument("--no-crawl", action="store_true", help="Skip live crawl; run Wayback-only mode")
+    parser.add_argument("--no-crawl", action="store_true", help="Skip live crawl; Wayback-only mode")
     parser.add_argument("--allow-subdomains", action="store_true", help="Allow subdomains within scope")
     parser.add_argument("--allow-external", action="store_true", help="Allow external hosts")
     parser.add_argument("--insecure", action="store_true", help="Disable TLS certificate verification")
@@ -45,11 +45,12 @@ def build_parser() -> ArgumentParser:
     # --- Output ---
     parser.add_argument("--output", "-o", choices=("text", "json", "csv"), default="text", help="Output format")
     parser.add_argument("--output-file", type=Path, help="Write output to file instead of stdout")
-    parser.add_argument("--output-dir", type=Path, help="Save one file per target in this directory")
+    parser.add_argument("--output-dir", type=Path,
+                        help="Directory to save results (default when --wayback: ./results/)")
     parser.add_argument("--placeholder", "-p", default="FUZZ",
                         help="Replace all query-param values with this string (default: FUZZ)")
     parser.add_argument("--params-only", action="store_true", help="Print only discovered parameter names")
-    parser.add_argument("--endpoints-only", action="store_true", help="Print only discovered endpoints/URLs")
+    parser.add_argument("--endpoints-only", action="store_true", help="Print only discovered endpoint URLs")
     parser.add_argument("--silent", "-s", action="store_true", help="Suppress banner and progress output")
 
     return parser
@@ -75,6 +76,14 @@ def parse_headers(header_list: list[str] | None) -> dict[str, str]:
     return result
 
 
+def _save_wayback_file(domain: str, urls: list[str], out_dir: Path) -> Path:
+    """Save FUZZ-parameterised URLs to results/domain.txt and return the path."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_file = out_dir / f"{domain}.txt"
+    out_file.write_text("\n".join(urls) + ("\n" if urls else ""), encoding="utf-8")
+    return out_file
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -87,31 +96,86 @@ def main(argv: list[str] | None = None) -> int:
 
     extra_headers = parse_headers(args.headers)
     filter_ext = not args.no_filter_extensions
+    placeholder = args.placeholder  # default "FUZZ"
 
     # ------------------------------------------------------------------ #
     # Wayback Machine mining                                               #
     # ------------------------------------------------------------------ #
     wayback_results: dict[str, list[str]] = {}
+    miner: WaybackMiner | None = None
+
     if args.wayback:
         miner = WaybackMiner(
-            placeholder=args.placeholder,
+            placeholder=placeholder,
             proxies={"http": args.proxy, "https": args.proxy} if args.proxy else {},
             filter_extensions=filter_ext,
         )
+
+        # Determine output directory (default: ./results/)
+        out_dir = args.output_dir or Path("results")
+
         for target in targets:
             domain = target.replace("https://", "").replace("http://", "").split("/")[0]
+
             if not args.silent:
-                console.print(f"[bold green][Wayback][/bold green] Mining [cyan]{domain}[/cyan] ...")
+                console.print(f"\n[bold green][Wayback][/bold green] Mining [cyan]{domain}[/cyan] from archive.org ...")
+
             urls = miner.mine(domain)
             wayback_results[target] = urls
+
+            if not urls:
+                if not args.silent:
+                    console.print(f"  [yellow]⚠  No archived parameterised URLs found for {domain}[/yellow]")
+                continue
+
             if not args.silent:
-                console.print(f"  → [green]{len(urls)}[/green] historical URLs found")
+                console.print(f"  [green]✔  {len(urls)}[/green] parameterised URLs discovered")
+
+            # Always auto-save to results/domain.txt unless --output-file was given
+            if not args.output_file:
+                saved = _save_wayback_file(domain, urls, out_dir)
+                if not args.silent:
+                    console.print(f"  [bold cyan]Saved →[/bold cyan] {saved}")
+
+            # Always print the FUZZ URLs to stdout (they're the main deliverable)
+            if not args.output_file:
+                sys.stdout.write("\n".join(urls) + "\n")
+
+    # ------------------------------------------------------------------ #
+    # No-crawl mode: Wayback-only, skip live HTTP crawl                   #
+    # ------------------------------------------------------------------ #
+    if args.no_crawl:
+        if not args.wayback:
+            parser.error("--no-crawl requires --wayback (nothing to do otherwise)")
+
+        # Build a skeleton ReconResult from Wayback data
+        from .core import ReconResult
+        result = ReconResult(target=";".join(targets))
+        for target, urls in wayback_results.items():
+            result.wayback_urls.extend(urls)
+            if miner and urls:
+                for p in miner.extract_parameters(urls):
+                    key = f"{p.name}|{p.source}|{p.url or ''}"
+                    result.parameters.setdefault(key, p)
+
+        if args.params_only:
+            names = sorted({p.name for p in result.parameters.values()})
+            if names:
+                sys.stdout.write("\n".join(names) + "\n")
+            elif not args.silent:
+                console.print("[yellow]No parameters found.[/yellow]")
+
+        if not args.silent:
+            console.print(
+                f"\n[bold]Summary:[/bold] "
+                f"[green]{len(result.wayback_urls)}[/green] Wayback URLs  |  "
+                f"[yellow]{len(result.parameters)}[/yellow] unique parameters"
+            )
+        return 0
 
     # ------------------------------------------------------------------ #
     # Live crawl                                                           #
     # ------------------------------------------------------------------ #
-    progress = make_progress(silent=args.silent or args.no_crawl)
-
     engine = ReconScope(
         max_depth=args.max_depth,
         max_pages=args.max_pages,
@@ -126,39 +190,30 @@ def main(argv: list[str] | None = None) -> int:
         delay=args.delay,
         extra_headers=extra_headers,
         filter_extensions=filter_ext,
-        placeholder=args.placeholder if args.placeholder != "FUZZ" else None,
+        placeholder=placeholder if placeholder != "FUZZ" else None,
     )
 
-    if args.no_crawl:
-        # Build a skeleton result from Wayback data only
-        from .core import ReconResult, DiscoveredParameter
-        result = ReconResult(target=";".join(targets))
-        for target, urls in wayback_results.items():
-            result.wayback_urls.extend(urls)
+    progress = make_progress(silent=args.silent)
+    with progress:
+        task = progress.add_task("[cyan]Crawling...", total=args.max_pages * len(targets))
+
+        def _cb(visited: int, _max: int) -> None:
+            progress.update(task, completed=visited)
+
+        engine.progress_callback = _cb
+        result = engine.run(targets)
+        progress.update(task, completed=args.max_pages * len(targets))
+
+    # Attach Wayback URLs to crawl result
+    for target, urls in wayback_results.items():
+        result.wayback_urls.extend(u for u in urls if u not in result.wayback_urls)
+        if miner and urls:
             for p in miner.extract_parameters(urls):
                 key = f"{p.name}|{p.source}|{p.url or ''}"
                 result.parameters.setdefault(key, p)
-    else:
-        with progress:
-            task = progress.add_task("[cyan]Crawling...", total=args.max_pages * len(targets))
-
-            def _cb(visited: int, _max: int) -> None:
-                progress.update(task, completed=visited)
-
-            engine.progress_callback = _cb
-            result = engine.run(targets)
-            progress.update(task, completed=args.max_pages * len(targets))
-
-        # Attach Wayback URLs to result
-        for target, urls in wayback_results.items():
-            result.wayback_urls.extend(u for u in urls if u not in result.wayback_urls)
-            if args.wayback:
-                for p in miner.extract_parameters(urls):
-                    key = f"{p.name}|{p.source}|{p.url or ''}"
-                    result.parameters.setdefault(key, p)
 
     # ------------------------------------------------------------------ #
-    # Build output                                                         #
+    # Build output for crawl results                                       #
     # ------------------------------------------------------------------ #
     if args.params_only:
         output = engine.export_params_only(result)
@@ -170,13 +225,6 @@ def main(argv: list[str] | None = None) -> int:
         output = engine.export_csv(result)
     else:
         output = engine.export_text(result)
-
-    # Rich pretty-print (only for non-machine-readable modes without a file target)
-    if not args.silent and not args.params_only and not args.endpoints_only and not args.output_file and args.output == "text":
-        print_results(result, params_only=args.params_only, endpoints_only=args.endpoints_only, silent=args.silent)
-        # Also dump plain-text for pipeable output
-        sys.stdout.write(output + "\n")
-        return 0
 
     if args.output_dir:
         saved = engine.save_output_dir(result, args.output_dir, args.output)
@@ -192,6 +240,11 @@ def main(argv: list[str] | None = None) -> int:
             sys.stdout.write("\n")
 
     if not args.silent:
-        print_results(result, params_only=args.params_only, endpoints_only=args.endpoints_only, silent=False)
+        print_results(
+            result,
+            params_only=args.params_only,
+            endpoints_only=args.endpoints_only,
+            silent=False,
+        )
 
     return 0
