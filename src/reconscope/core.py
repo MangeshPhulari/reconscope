@@ -45,13 +45,15 @@ SKIP_EXTENSIONS = {
 
 # URL / parameter / JS-endpoint regexes
 URL_RE = re.compile(r"(?P<url>(?:https?:)?//[A-Za-z0-9._~:/?#\[\]@!$&'()*+,;=%-]+|/[A-Za-z0-9._~:/?#\[\]@!$&'()*+,;=%-]+)")
-PARAM_RE = re.compile(r"(?:[?&]|\b(?<![.!]))([A-Za-z_][A-Za-z0-9_]{2,60})=(?![=(])")
+# Stricter parameter regex: must be preceded by ?, &, whitespace or start of line.
+PARAM_RE = re.compile(r"(?:[?&]|\s|^)([A-Za-z_][A-Za-z0-9_]{2,60})=(?![=(])")
 
 PARAM_BLACKLIST = {
     "length", "exec", "test", "toString", "valueOf", "constructor", "prototype",
     "async", "charSet", "byteLength", "global", "ignoreCase", "multiline",
     "source", "sticky", "unicode", "flags", "index", "input", "groups",
-    "message", "name", "stack", "cause", "as", "is", "of", "in", "to"
+    "message", "name", "stack", "cause", "as", "is", "of", "in", "to",
+    "void", "new", "delete", "typeof", "instanceof", "break", "continue"
 }
 
 # Deep JS patterns (fetch, axios, XHR, $.ajax, template literals, Next.js)
