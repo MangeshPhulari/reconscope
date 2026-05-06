@@ -824,55 +824,131 @@ class ReconScope:
         return "\n".join(sorted(urls))
 
     def export_urls_only(self, result: ReconResult) -> str:
-        """Flat list of target-only URLs: clean endpoints + all fuzzed parameterized URLs."""
+        """
+        Professional flat URL list for pentest wordlists.
+        Contains:
+          1. All target-domain endpoints (clean, no external noise)
+          2. All URLs that have real query parameters (fuzzed with placeholder)
+          3. Generated: every discovered param name × every discovered API/page endpoint
+          4. Passive wayback URLs (target-only, fuzzed)
+        """
         target_domain = result.target.replace("https://", "").replace("http://", "").split("/")[0]
         all_urls: set[str] = set()
 
-        # Step 1: Collect target-only endpoints
-        target_endpoints: set[str] = set()
-        for ep in result.endpoints.values():
-            try:
-                host = urlparse(ep.url).netloc.lower()
-                if host == target_domain or host.endswith(f".{target_domain}"):
-                    target_endpoints.add(ep.url)
-                    all_urls.add(ep.url)
-            except Exception:
-                continue
-
-        # Step 2: Add fuzzed parameterized URLs (target-only)
-        for p in result.parameters.values():
-            if not p.url:
-                continue
-            try:
-                host = urlparse(p.url).netloc.lower()
-                if host == target_domain or host.endswith(f".{target_domain}"):
-                    temp_ep = DiscoveredEndpoint(url=p.url, source=p.source)
-                    all_urls.add(self._fuzz_endpoint(temp_ep).url)
-            except Exception:
-                continue
-
-        # Step 3: Combine loose parameters with the target's homepage/endpoints
-        # This generates new testable URLs from parameter names found in JS
-        loose_params = [p.name for p in result.parameters.values() if not p.url]
-        if loose_params and target_endpoints:
-            # Build a query string from loose params and attach to the base URL
-            # Group them in batches to avoid enormous URLs
-            base_url = f"https://{target_domain}/"
-            for i in range(0, len(loose_params), 10):
-                batch = loose_params[i:i+10]
-                query = "&".join(f"{name}={self.placeholder}" for name in batch)
-                all_urls.add(f"{base_url}?{query}")
-
-        # Step 4: Add passive URLs (target-only)
-        for url in result.wayback_urls:
+        # ── Helper: is a URL on the target? ───────────────────────────────
+        def is_target(url: str) -> bool:
             try:
                 host = urlparse(url).netloc.lower()
-                if host == target_domain or host.endswith(f".{target_domain}"):
-                    all_urls.add(url)
+                return host == target_domain or host.endswith(f".{target_domain}")
+            except Exception:
+                return False
+
+        # ── Helper: is a URL a static asset we should skip? ───────────────
+        def is_static(url: str) -> bool:
+            static_exts = {".js", ".css", ".woff", ".woff2", ".png", ".jpg",
+                           ".gif", ".svg", ".ico", ".map", ".ttf", ".eot"}
+            path = urlparse(url).path.lower()
+            return any(path.endswith(ext) for ext in static_exts)
+
+        # ── Step 1: Collect all target-only endpoints ─────────────────────
+        target_endpoints: set[str] = set()
+        for ep in result.endpoints.values():
+            if is_target(ep.url):
+                # Strip query string for clean endpoint list
+                parsed = urlparse(ep.url)
+                clean = parsed._replace(query="", fragment="")
+                target_endpoints.add(urlunparse(clean))
+                all_urls.add(ep.url)  # also add original (may have params)
+
+        # ── Step 2: Separate API endpoints for cross-combining ────────────
+        api_keywords = {"api", "v1", "v2", "v3", "rest", "graphql", "swagger",
+                        "openapi", "docs", "auth", "token", "login", "admin",
+                        "user", "account", "profile", "search", "query"}
+        api_endpoints: set[str] = set()
+        page_endpoints: set[str] = set()
+        for ep in target_endpoints:
+            path = urlparse(ep).path.lower()
+            if any(kw in path for kw in api_keywords):
+                api_endpoints.add(ep)
+            else:
+                page_endpoints.add(ep)
+
+        # ── Step 3: Collect all unique real parameter names ───────────────
+        # Real params = found in URLs with query strings (not just JS variable names)
+        real_param_names: list[str] = sorted({
+            p.name for p in result.parameters.values()
+            if p.source in ("url-query", "html:form-field")
+        })
+        # Also collect loose text params (found in JS — might be API params)
+        loose_param_names: list[str] = sorted({
+            p.name for p in result.parameters.values()
+            if p.source == "text"
+        })
+        all_param_names: list[str] = sorted(set(real_param_names) | set(loose_param_names))
+
+        # ── Step 4: Add fuzzed URLs for every param-bearing URL ───────────
+        seen_base_paths: set[str] = set()
+        for p in result.parameters.values():
+            if not p.url or not is_target(p.url):
+                continue
+            if is_static(p.url):
+                continue
+            temp_ep = DiscoveredEndpoint(url=p.url, source=p.source)
+            fuzzed = self._fuzz_endpoint(temp_ep).url
+            all_urls.add(fuzzed)
+            # Track which paths already have params so we don't double-add
+            parsed = urlparse(p.url)
+            seen_base_paths.add(parsed.path)
+
+        # ── Step 5: Generate cross-product URLs ───────────────────────────
+        # For each non-static target endpoint × each real parameter name
+        # This generates: /api/v1?user=FUZZ, /api/v1?id=FUZZ etc.
+        endpoints_to_combine = (api_endpoints | page_endpoints) - set(result.visited_pages)
+        # Also include visited pages for completeness
+        for vp in result.visited_pages:
+            if is_target(vp) and not is_static(vp):
+                endpoints_to_combine.add(vp)
+
+        for ep in endpoints_to_combine:
+            parsed_ep = urlparse(ep)
+            # Only add individual param combinations for real params (not 379 loose ones)
+            for param in real_param_names:
+                new_url = urlunparse(parsed_ep._replace(
+                    query=f"{param}={self.placeholder}", fragment=""
+                ))
+                all_urls.add(new_url)
+            # Add all-in-one combined URL with all real params
+            if real_param_names:
+                combo_query = "&".join(f"{p}={self.placeholder}" for p in real_param_names)
+                all_urls.add(urlunparse(parsed_ep._replace(query=combo_query, fragment="")))
+
+        # ── Step 6: Loose param batch combinations on API routes ──────────
+        # Group loose params in batches of 5 applied to api endpoints
+        if loose_param_names and api_endpoints:
+            for ep in api_endpoints:
+                parsed_ep = urlparse(ep)
+                for i in range(0, len(loose_param_names), 5):
+                    batch = loose_param_names[i:i + 5]
+                    query = "&".join(f"{name}={self.placeholder}" for name in batch)
+                    all_urls.add(urlunparse(parsed_ep._replace(query=query, fragment="")))
+
+        # ── Step 7: Passive wayback URLs (target-only, fuzzed) ───────────
+        for url in result.wayback_urls:
+            if is_target(url):
+                temp_ep = DiscoveredEndpoint(url=url, source="wayback")
+                all_urls.add(self._fuzz_endpoint(temp_ep).url)
+
+        # ── Final: Remove garbage non-URLs ────────────────────────────────
+        clean_urls = set()
+        for url in all_urls:
+            try:
+                p = urlparse(url)
+                if p.scheme in ("http", "https") and p.netloc:
+                    clean_urls.add(url)
             except Exception:
                 continue
 
-        return "\n".join(sorted(all_urls))
+        return "\n".join(sorted(clean_urls))
 
     def save_output_dir(self, result: ReconResult, out_dir: Path, fmt: str, content: str | None = None) -> Path:
         out_dir.mkdir(parents=True, exist_ok=True)
