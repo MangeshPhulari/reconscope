@@ -20,8 +20,9 @@ def build_parser() -> ArgumentParser:
     parser.add_argument("--input", "-i", type=Path, help="File containing one target per line")
 
     # --- Crawl behaviour ---
-    parser.add_argument("--max-depth", type=int, default=2, help="Maximum crawl depth (default: 2)")
-    parser.add_argument("--max-pages", type=int, default=250, help="Maximum pages per target (default: 250)")
+    parser.add_argument("--max-depth", type=int, default=3, help="Maximum crawl depth (default: 3, 0=unlimited)")
+    parser.add_argument("--max-pages", type=int, default=500, help="Maximum pages per target (default: 500, 0=unlimited)")
+    parser.add_argument("--no-limit", action="store_true", help="Remove all crawl limits (unlimited depth & pages — may take a long time)")
     parser.add_argument("--concurrency", type=int, default=10, help="Concurrent fetches (default: 10)")
     parser.add_argument("--timeout", type=float, default=15.0, help="Request timeout in seconds (default: 15)")
     parser.add_argument("--delay", type=float, default=0.0, help="Delay between requests in seconds (default: 0)")
@@ -183,9 +184,13 @@ def main(argv: list[str] | None = None) -> int:
     # ------------------------------------------------------------------ #
     # Live crawl                                                           #
     # ------------------------------------------------------------------ #
+    # Apply --no-limit: override depth/pages to 0 (unlimited)
+    max_depth = 0 if args.no_limit else args.max_depth
+    max_pages = 0 if args.no_limit else args.max_pages
+
     engine = ReconScope(
-        max_depth=args.max_depth,
-        max_pages=args.max_pages,
+        max_depth=max_depth,
+        max_pages=max_pages,
         concurrency=args.concurrency,
         timeout=args.timeout,
         user_agent=args.user_agent,
@@ -200,16 +205,28 @@ def main(argv: list[str] | None = None) -> int:
         placeholder=placeholder,
     )
 
+    # For unlimited mode, show a spinner instead of a fixed progress bar
+    if args.no_limit:
+        progress_total = None
+        if not args.silent:
+            console.print("[bold yellow]⚠  No-Limit mode enabled — crawling until all pages are exhausted.[/bold yellow]")
+    else:
+        progress_total = max_pages * len(targets)
+
     progress = make_progress(silent=args.silent)
     with progress:
-        task = progress.add_task("[cyan]Crawling...", total=args.max_pages * len(targets))
+        task = progress.add_task("[cyan]Crawling...", total=progress_total)
 
         def _cb(visited: int, _max: int) -> None:
-            progress.update(task, completed=visited)
+            if args.no_limit:
+                progress.update(task, completed=visited, total=visited + 1)
+            else:
+                progress.update(task, completed=visited)
 
         engine.progress_callback = _cb
         result = engine.run(targets)
-        progress.update(task, completed=args.max_pages * len(targets))
+        if not args.no_limit:
+            progress.update(task, completed=progress_total)
 
     # Attach passive URLs to crawl result
     for target, urls in passive_results.items():

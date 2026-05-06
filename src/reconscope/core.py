@@ -446,10 +446,18 @@ class ReconScope:
         result = ReconResult(target=target)
         queue: deque[tuple[str, int]] = deque([(urlunparse(normalized), 0)])
         seen: set[str] = set()
+        unlimited_pages = (self.max_pages == 0)
+        unlimited_depth = (self.max_depth == 0)
 
-        while queue and len(result.visited_pages) < self.max_pages:
+        def _under_page_limit() -> bool:
+            return unlimited_pages or len(result.visited_pages) < self.max_pages
+
+        def _under_batch_limit(batch_len: int) -> bool:
+            return unlimited_pages or len(result.visited_pages) + batch_len < self.max_pages
+
+        while queue and _under_page_limit():
             batch: list[tuple[str, int]] = []
-            while queue and len(batch) < self.concurrency and len(result.visited_pages) + len(batch) < self.max_pages:
+            while queue and len(batch) < self.concurrency and _under_batch_limit(len(batch)):
                 current_url, depth = queue.popleft()
                 if current_url in seen:
                     continue
@@ -477,7 +485,7 @@ class ReconScope:
                     for parameter in bundle.parameters:
                         key = f"{parameter.name}|{parameter.source}|{parameter.url or ''}"
                         result.parameters.setdefault(key, parameter)
-                    if depth < self.max_depth:
+                    if unlimited_depth or depth < self.max_depth:
                         for candidate in bundle.urls:
                             if candidate not in seen and self._is_allowed(candidate, allowed_hosts):
                                 queue.append((candidate, depth + 1))
