@@ -120,10 +120,17 @@ def _print_summary_table(result: "ReconResult") -> None:
     table = Table(title="[bold]Scan Summary[/bold]", box=box.ROUNDED, show_header=True, header_style="bold magenta")
     table.add_column("Metric", style="dim")
     table.add_column("Count", justify="right", style="bold white")
+    
     table.add_row("Pages visited", str(len(result.visited_pages)))
-    table.add_row("Endpoints", str(len(result.endpoints)))
-    table.add_row("Parameters", str(len(result.parameters)))
+    table.add_row("Endpoints Found", str(len(result.endpoints)))
+    
+    # Count how many URLs actually have parameters
+    param_urls_count = len({p.url for p in result.parameters.values() if p.url})
+    table.add_row("Parameterized URLs", str(param_urls_count))
+    table.add_row("Unique Param Names", str(len(result.parameters)))
+    
     table.add_row("Passive URLs", str(len(result.wayback_urls)))
-    table.add_row("Secrets", str(len(result.secrets)))
+    table.add_row("Secrets Found", str(len(result.secrets)))
+    
     console.print(table)
     console.print()
