@@ -52,10 +52,16 @@ def print_results(
     result: "ReconResult",
     params_only: bool = False,
     endpoints_only: bool = False,
+    flat: bool = False,
     silent: bool = False,
 ) -> None:
     """Print a color-coded summary of the recon result."""
     if silent:
+        return
+
+    if flat:
+        # In flat mode, URLs were already printed to stdout. Just show summary table.
+        _print_summary_table(result)
         return
 
     console.print()

@@ -53,6 +53,7 @@ def build_parser() -> ArgumentParser:
                         help="Replace all query-param values with this string (default: FUZZ)")
     parser.add_argument("--params-only", action="store_true", help="Print only discovered parameter names")
     parser.add_argument("--endpoints-only", action="store_true", help="Print only discovered endpoint URLs")
+    parser.add_argument("--flat", action="store_true", help="Print flat list of all discovered URLs (endpoints + parameters)")
     parser.add_argument("--silent", "-s", action="store_true", help="Suppress banner and progress output")
 
     return parser
@@ -226,6 +227,8 @@ def main(argv: list[str] | None = None) -> int:
         output = engine.export_params_only(result)
     elif args.endpoints_only:
         output = engine.export_endpoints_only(result)
+    elif args.flat:
+        output = engine.export_urls_only(result)
     elif args.output == "json":
         output = engine.export_json(result)
     elif args.output == "csv":
@@ -248,6 +251,6 @@ def main(argv: list[str] | None = None) -> int:
         # Also print to stdout if not silent
         if not args.silent:
             # We don't print the whole huge output to terminal again, just a summary
-            print_results(result, params_only=args.params_only, endpoints_only=args.endpoints_only)
+            print_results(result, params_only=args.params_only, endpoints_only=args.endpoints_only, flat=args.flat)
 
     return 0

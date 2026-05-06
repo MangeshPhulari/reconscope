@@ -45,7 +45,7 @@ SKIP_EXTENSIONS = {
 
 # URL / parameter / JS-endpoint regexes
 URL_RE = re.compile(r"(?P<url>(?:https?:)?//[A-Za-z0-9._~:/?#\[\]@!$&'()*+,;=%-]+|/[A-Za-z0-9._~:/?#\[\]@!$&'()*+,;=%-]+)")
-PARAM_RE = re.compile(r"(?:[?&]|\b(?<!\.))([A-Za-z_][A-Za-z0-9_\-]{1,60})=(?![=(])")
+PARAM_RE = re.compile(r"(?:[?&]|\b(?<![.!]))([A-Za-z_][A-Za-z0-9_]{2,60})=(?![=(])")
 
 PARAM_BLACKLIST = {
     "length", "exec", "test", "toString", "valueOf", "constructor", "prototype",
@@ -786,6 +786,23 @@ class ReconScope:
     def export_endpoints_only(self, result: ReconResult) -> str:
         urls = sorted({ep.url for ep in result.endpoints.values()} | set(result.wayback_urls))
         return "\n".join(urls)
+
+    def export_urls_only(self, result: ReconResult) -> str:
+        """Returns a flat list of ALL clean URLs (endpoints + fuzzed parameter URLs)."""
+        all_urls = set()
+        # Add all endpoints
+        for ep in result.endpoints.values():
+            all_urls.add(ep.url)
+        # Add all fuzzed parameter URLs
+        for p in result.parameters.values():
+            if p.url:
+                temp_ep = DiscoveredEndpoint(url=p.url, source=p.source)
+                all_urls.add(self._fuzz_endpoint(temp_ep).url)
+        # Add passive URLs
+        for url in result.wayback_urls:
+            all_urls.add(url)
+            
+        return "\n".join(sorted(all_urls))
 
     def save_output_dir(self, result: ReconResult, out_dir: Path, fmt: str, content: str | None = None) -> Path:
         out_dir.mkdir(parents=True, exist_ok=True)
