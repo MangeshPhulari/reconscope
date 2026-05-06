@@ -387,8 +387,8 @@ class ReconScope:
     def __init__(
         self,
         *,
-        max_depth: int = 2,
-        max_pages: int = 250,
+        max_depth: int = 3,
+        max_pages: int = 500,
         concurrency: int = 8,
         timeout: float = 10.0,
         user_agent: str | None = None,
@@ -785,25 +785,85 @@ class ReconScope:
         names = sorted({p.name for p in result.parameters.values()})
         return "\n".join(names)
 
+    def _is_target_url(self, url: str, target: str) -> bool:
+        """Check if a URL belongs to the target domain."""
+        try:
+            parsed = urlparse(url)
+            target_domain = target.replace("https://", "").replace("http://", "").split("/")[0]
+            host = parsed.netloc.lower()
+            return host == target_domain or host.endswith(f".{target_domain}")
+        except Exception:
+            return False
+
     def export_endpoints_only(self, result: ReconResult) -> str:
-        urls = sorted({ep.url for ep in result.endpoints.values()} | set(result.wayback_urls))
-        return "\n".join(urls)
+        """Clean list of target-only endpoints."""
+        target_domain = result.target.replace("https://", "").replace("http://", "").split("/")[0]
+        urls = set()
+        for ep in result.endpoints.values():
+            try:
+                host = urlparse(ep.url).netloc.lower()
+                if host == target_domain or host.endswith(f".{target_domain}"):
+                    urls.add(ep.url)
+            except Exception:
+                continue
+        for url in result.wayback_urls:
+            try:
+                host = urlparse(url).netloc.lower()
+                if host == target_domain or host.endswith(f".{target_domain}"):
+                    urls.add(url)
+            except Exception:
+                continue
+        return "\n".join(sorted(urls))
 
     def export_urls_only(self, result: ReconResult) -> str:
-        """Returns a flat list of ALL clean URLs (endpoints + fuzzed parameter URLs)."""
-        all_urls = set()
-        # Add all endpoints
+        """Flat list of target-only URLs: clean endpoints + all fuzzed parameterized URLs."""
+        target_domain = result.target.replace("https://", "").replace("http://", "").split("/")[0]
+        all_urls: set[str] = set()
+
+        # Step 1: Collect target-only endpoints
+        target_endpoints: set[str] = set()
         for ep in result.endpoints.values():
-            all_urls.add(ep.url)
-        # Add all fuzzed parameter URLs
+            try:
+                host = urlparse(ep.url).netloc.lower()
+                if host == target_domain or host.endswith(f".{target_domain}"):
+                    target_endpoints.add(ep.url)
+                    all_urls.add(ep.url)
+            except Exception:
+                continue
+
+        # Step 2: Add fuzzed parameterized URLs (target-only)
         for p in result.parameters.values():
-            if p.url:
-                temp_ep = DiscoveredEndpoint(url=p.url, source=p.source)
-                all_urls.add(self._fuzz_endpoint(temp_ep).url)
-        # Add passive URLs
+            if not p.url:
+                continue
+            try:
+                host = urlparse(p.url).netloc.lower()
+                if host == target_domain or host.endswith(f".{target_domain}"):
+                    temp_ep = DiscoveredEndpoint(url=p.url, source=p.source)
+                    all_urls.add(self._fuzz_endpoint(temp_ep).url)
+            except Exception:
+                continue
+
+        # Step 3: Combine loose parameters with the target's homepage/endpoints
+        # This generates new testable URLs from parameter names found in JS
+        loose_params = [p.name for p in result.parameters.values() if not p.url]
+        if loose_params and target_endpoints:
+            # Build a query string from loose params and attach to the base URL
+            # Group them in batches to avoid enormous URLs
+            base_url = f"https://{target_domain}/"
+            for i in range(0, len(loose_params), 10):
+                batch = loose_params[i:i+10]
+                query = "&".join(f"{name}={self.placeholder}" for name in batch)
+                all_urls.add(f"{base_url}?{query}")
+
+        # Step 4: Add passive URLs (target-only)
         for url in result.wayback_urls:
-            all_urls.add(url)
-            
+            try:
+                host = urlparse(url).netloc.lower()
+                if host == target_domain or host.endswith(f".{target_domain}"):
+                    all_urls.add(url)
+            except Exception:
+                continue
+
         return "\n".join(sorted(all_urls))
 
     def save_output_dir(self, result: ReconResult, out_dir: Path, fmt: str, content: str | None = None) -> Path:
