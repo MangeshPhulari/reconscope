@@ -196,7 +196,7 @@ def main(argv: list[str] | None = None) -> int:
         delay=args.delay,
         extra_headers=extra_headers,
         filter_extensions=filter_ext,
-        placeholder=placeholder if placeholder != "FUZZ" else None,
+        placeholder=placeholder,
     )
 
     progress = make_progress(silent=args.silent)
@@ -240,7 +240,8 @@ def main(argv: list[str] | None = None) -> int:
             console.print(f"[bold green]Saved Report:[/bold green] {args.output_file}")
     else:
         # Default to saving in out_dir/target.txt (or target.json/csv)
-        saved = engine.save_output_dir(result, out_dir, args.output)
+        # We pass the 'output' string to ensure it respects --params-only etc.
+        saved = engine.save_output_dir(result, out_dir, args.output, content=output)
         if not args.silent:
             console.print(f"[bold green]Report Saved:[/bold green] {saved}")
         

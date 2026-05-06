@@ -45,7 +45,14 @@ SKIP_EXTENSIONS = {
 
 # URL / parameter / JS-endpoint regexes
 URL_RE = re.compile(r"(?P<url>(?:https?:)?//[A-Za-z0-9._~:/?#\[\]@!$&'()*+,;=%-]+|/[A-Za-z0-9._~:/?#\[\]@!$&'()*+,;=%-]+)")
-PARAM_RE = re.compile(r"(?:[?&]|\b)([A-Za-z_][A-Za-z0-9_\-]{1,60})=")
+PARAM_RE = re.compile(r"(?:[?&]|\b(?<!\.))([A-Za-z_][A-Za-z0-9_\-]{1,60})=(?![=(])")
+
+PARAM_BLACKLIST = {
+    "length", "exec", "test", "toString", "valueOf", "constructor", "prototype",
+    "async", "charSet", "byteLength", "global", "ignoreCase", "multiline",
+    "source", "sticky", "unicode", "flags", "index", "input", "groups",
+    "message", "name", "stack", "cause", "as", "is", "of", "in", "to"
+}
 
 # Deep JS patterns (fetch, axios, XHR, $.ajax, template literals, Next.js)
 JS_PATTERNS = [
@@ -407,7 +414,7 @@ class ReconScope:
         self.delay = delay
         self.extra_headers = extra_headers or {}
         self.filter_extensions = filter_extensions
-        self.placeholder = placeholder
+        self.placeholder = placeholder or "FUZZ"
         self.progress_callback = progress_callback  # called with (visited, max_pages)
         self._session = self._make_session()
 
@@ -608,15 +615,21 @@ class ReconScope:
     # Parameter extraction
     # ------------------------------------------------------------------
 
-    def _extract_parameters_from_text(self, text: str, base_url: str) -> set[DiscoveredParameter]:
-        parameters: set[DiscoveredParameter] = set()
+    def _extract_parameters_from_text(self, text: str, base_url: str | None = None) -> list[DiscoveredParameter]:
+        params = []
         for match in PARAM_RE.finditer(text):
-            parameters.add(DiscoveredParameter(name=match.group(1), source="text", url=base_url))
+            pname = match.group(1)
+            if pname.lower() in PARAM_BLACKLIST:
+                continue
+            params.append(DiscoveredParameter(name=pname, source="text", url=base_url))
+        
+        # Also find URLs in the text and extract their query parameters
         for match in URL_RE.finditer(text):
-            candidate = self._resolve(base_url, match.group("url"))
-            for key, _ in parse_qsl(urlparse(candidate).query, keep_blank_values=True):
-                parameters.add(DiscoveredParameter(name=key, source="url-query", url=candidate))
-        return parameters
+            candidate = self._resolve(base_url or "", match.group("url"))
+            if candidate:
+                for key, _ in parse_qsl(urlparse(candidate).query, keep_blank_values=True):
+                    params.append(DiscoveredParameter(name=key, source="url-query", url=candidate))
+        return params
 
     # ------------------------------------------------------------------
     # URL helpers
@@ -732,16 +745,24 @@ class ReconScope:
             lines.append(url)
 
         lines += ["", "## Parameterized URLs", ""]
-        # Reconstruct URLs with FUZZ placeholders for all discovered parameters
+        # Reconstruct URLs with placeholders for all discovered parameters
         fuzzed_urls = set()
+        loose_params = set()
+        
         for p in result.parameters.values():
             if p.url:
-                # We reuse the fuzzing logic to ensure query params are placeholder-ready
                 temp_ep = DiscoveredEndpoint(url=p.url, source=p.source)
                 fuzzed_urls.add(self._fuzz_endpoint(temp_ep).url)
+            else:
+                loose_params.add(p.name)
         
         for url in sorted(fuzzed_urls):
             lines.append(url)
+
+        if loose_params:
+            lines += ["", "## Discovered Parameter Names (Not tied to URL)", ""]
+            for name in sorted(loose_params):
+                lines.append(name)
 
         if result.wayback_urls:
             lines += ["", "## Passive Discovery URLs", ""]
@@ -766,16 +787,19 @@ class ReconScope:
         urls = sorted({ep.url for ep in result.endpoints.values()} | set(result.wayback_urls))
         return "\n".join(urls)
 
-    def save_output_dir(self, result: ReconResult, out_dir: Path, fmt: str) -> None:
+    def save_output_dir(self, result: ReconResult, out_dir: Path, fmt: str, content: str | None = None) -> Path:
         out_dir.mkdir(parents=True, exist_ok=True)
         domain = result.target.replace("https://", "").replace("http://", "").split("/")[0]
         fname = out_dir / f"{domain}.{fmt if fmt != 'text' else 'txt'}"
-        if fmt == "json":
-            content = self.export_json(result)
-        elif fmt == "csv":
-            content = self.export_csv(result)
-        else:
-            content = self.export_text(result)
+        
+        if content is None:
+            if fmt == "json":
+                content = self.export_json(result)
+            elif fmt == "csv":
+                content = self.export_csv(result)
+            else:
+                content = self.export_text(result)
+                
         fname.write_text(content, encoding="utf-8")
         return fname
 
