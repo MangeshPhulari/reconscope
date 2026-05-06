@@ -717,22 +717,45 @@ class ReconScope:
         return buffer.getvalue()
 
     def export_text(self, result: ReconResult) -> str:
-        lines = [f"Target: {result.target}", "", "Endpoints:"]
-        for ep in sorted(result.endpoints.values(), key=lambda e: e.url):
-            lines.append(f"  {ep.url}  [{ep.source}]")
-        lines += ["", "Parameters:"]
-        for p in sorted(result.parameters.values(), key=lambda x: x.name):
-            suffix = f"  ({p.url})" if p.url else ""
-            lines.append(f"  {p.name}  [{p.source}]{suffix}")
+        lines = [f"# ReconScope Results for {result.target}", ""]
+        
         if result.secrets:
-            lines += ["", "Secrets Found:"]
+            lines += ["## Potential Secrets / Leaks", ""]
             for s in result.secrets:
-                lines.append(f"  [{s.type}] {s.value}  ({s.url})")
+                lines.append(f"[{s.type}] {s.value} (Found at: {s.url})")
+            lines.append("")
+
+        lines += ["## Endpoints", ""]
+        # Unique set of all discovered endpoint URLs
+        unique_endpoints = sorted({ep.url for ep in result.endpoints.values()})
+        for url in unique_endpoints:
+            lines.append(url)
+
+        lines += ["", "## Parameterized URLs", ""]
+        # Reconstruct URLs with FUZZ placeholders for all discovered parameters
+        fuzzed_urls = set()
+        for p in result.parameters.values():
+            if p.url:
+                # We reuse the fuzzing logic to ensure query params are placeholder-ready
+                temp_ep = DiscoveredEndpoint(url=p.url, source=p.source)
+                fuzzed_urls.add(self._fuzz_endpoint(temp_ep).url)
+        
+        for url in sorted(fuzzed_urls):
+            lines.append(url)
+
         if result.wayback_urls:
-            lines += ["", "Passive URLs:"]
+            lines += ["", "## Passive Discovery URLs", ""]
             for url in sorted(result.wayback_urls):
-                lines.append(f"  {url}")
-        lines += ["", f"Visited pages: {len(result.visited_pages)}"]
+                lines.append(url)
+
+        lines += ["", "## Scan Summary", ""]
+        lines.append(f"Target: {result.target}")
+        lines.append(f"Pages visited: {len(result.visited_pages)}")
+        lines.append(f"Unique Endpoints: {len(result.endpoints)}")
+        lines.append(f"Unique Parameters: {len(result.parameters)}")
+        lines.append(f"Passive URLs: {len(result.wayback_urls)}")
+        lines.append(f"Secrets Found: {len(result.secrets)}")
+        
         return "\n".join(lines)
 
     def export_params_only(self, result: ReconResult) -> str:

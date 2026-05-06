@@ -138,12 +138,6 @@ def main(argv: list[str] | None = None) -> int:
             if not args.silent:
                 console.print(f"  [green]✔  {len(urls)}[/green] parameterised URLs discovered across all sources")
 
-            # Always auto-save to results/domain.txt unless --output-file was given
-            if not args.output_file:
-                saved = _save_passive_file(domain, urls, out_dir)
-                if not args.silent:
-                    console.print(f"  [bold cyan]Saved →[/bold cyan] {saved}")
-
             # Always print the FUZZ URLs to stdout
             if not args.output_file and not args.silent:
                 sys.stdout.write("\n".join(urls[:10]) + (f"\n... and {len(urls)-10} more\n" if len(urls) > 10 else "\n"))
@@ -182,6 +176,9 @@ def main(argv: list[str] | None = None) -> int:
             )
         return 0
 
+    # Determine output directory (default: ./results/)
+    out_dir = args.output_dir or Path("results")
+
     # ------------------------------------------------------------------ #
     # Live crawl                                                           #
     # ------------------------------------------------------------------ #
@@ -218,6 +215,7 @@ def main(argv: list[str] | None = None) -> int:
         result.wayback_urls.extend(u for u in urls if u not in result.wayback_urls)
         if target in passive_params:
             for p in passive_params[target]:
+                # Unique key to avoid duplicates
                 key = f"{p.name}|{p.source}|{p.url or ''}"
                 result.parameters.setdefault(key, p)
 
@@ -235,25 +233,20 @@ def main(argv: list[str] | None = None) -> int:
     else:
         output = engine.export_text(result)
 
-    if args.output_dir:
-        saved = engine.save_output_dir(result, args.output_dir, args.output)
-        if not args.silent:
-            console.print(f"[bold green]Saved:[/bold green] {saved}")
-    elif args.output_file:
+    # Final Save Logic
+    if args.output_file:
         args.output_file.write_text(output, encoding="utf-8")
         if not args.silent:
-            console.print(f"[bold green]Saved:[/bold green] {args.output_file}")
+            console.print(f"[bold green]Saved Report:[/bold green] {args.output_file}")
     else:
-        sys.stdout.write(output)
-        if not output.endswith("\n"):
-            sys.stdout.write("\n")
-
-    if not args.silent:
-        print_results(
-            result,
-            params_only=args.params_only,
-            endpoints_only=args.endpoints_only,
-            silent=False,
-        )
+        # Default to saving in out_dir/target.txt (or target.json/csv)
+        saved = engine.save_output_dir(result, out_dir, args.output)
+        if not args.silent:
+            console.print(f"[bold green]Report Saved:[/bold green] {saved}")
+        
+        # Also print to stdout if not silent
+        if not args.silent:
+            # We don't print the whole huge output to terminal again, just a summary
+            print_results(result, params_only=args.params_only, endpoints_only=args.endpoints_only)
 
     return 0
