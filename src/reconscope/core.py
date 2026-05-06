@@ -825,17 +825,13 @@ class ReconScope:
 
     def export_urls_only(self, result: ReconResult) -> str:
         """
-        Professional flat URL list for pentest wordlists.
-        Contains:
-          1. All target-domain endpoints (clean, no external noise)
-          2. All URLs that have real query parameters (fuzzed with placeholder)
-          3. Generated: every discovered param name × every discovered API/page endpoint
-          4. Passive wayback URLs (target-only, fuzzed)
+        ParamSpider-style output: ONLY URLs with query parameters (?param=FUZZ).
+        No clean endpoints without params. Use --endpoints-only for those.
         """
         target_domain = result.target.replace("https://", "").replace("http://", "").split("/")[0]
-        all_urls: set[str] = set()
+        param_urls: set[str] = set()
 
-        # ── Helper: is a URL on the target? ───────────────────────────────
+        # ── Helpers ──────────────────────────────────────────────────────
         def is_target(url: str) -> bool:
             try:
                 host = urlparse(url).netloc.lower()
@@ -843,107 +839,75 @@ class ReconScope:
             except Exception:
                 return False
 
-        # ── Helper: is a URL a static asset we should skip? ───────────────
         def is_static(url: str) -> bool:
             static_exts = {".js", ".css", ".woff", ".woff2", ".png", ".jpg",
-                           ".gif", ".svg", ".ico", ".map", ".ttf", ".eot"}
-            path = urlparse(url).path.lower()
-            return any(path.endswith(ext) for ext in static_exts)
+                           ".gif", ".svg", ".ico", ".map", ".ttf", ".eot",
+                           ".woff", ".woff2", ".otf"}
+            return any(urlparse(url).path.lower().endswith(ext) for ext in static_exts)
 
-        # ── Step 1: Collect all target-only endpoints ─────────────────────
-        target_endpoints: set[str] = set()
-        for ep in result.endpoints.values():
-            if is_target(ep.url):
-                # Strip query string for clean endpoint list
-                parsed = urlparse(ep.url)
-                clean = parsed._replace(query="", fragment="")
-                target_endpoints.add(urlunparse(clean))
-                all_urls.add(ep.url)  # also add original (may have params)
+        # ── Step 1: All discovered URLs that ALREADY have query params ────
+        # These are the gold — real URLs with real parameters from the site
+        for p in result.parameters.values():
+            if not p.url or not is_target(p.url) or is_static(p.url):
+                continue
+            parsed = urlparse(p.url)
+            if not parsed.query:
+                continue  # skip URLs without a query string
+            temp_ep = DiscoveredEndpoint(url=p.url, source=p.source)
+            fuzzed = self._fuzz_endpoint(temp_ep).url
+            param_urls.add(fuzzed)
 
-        # ── Step 2: Separate API endpoints for cross-combining ────────────
-        api_keywords = {"api", "v1", "v2", "v3", "rest", "graphql", "swagger",
-                        "openapi", "docs", "auth", "token", "login", "admin",
-                        "user", "account", "profile", "search", "query"}
-        api_endpoints: set[str] = set()
-        page_endpoints: set[str] = set()
-        for ep in target_endpoints:
-            path = urlparse(ep).path.lower()
-            if any(kw in path for kw in api_keywords):
-                api_endpoints.add(ep)
-            else:
-                page_endpoints.add(ep)
+        # ── Step 2: Passive wayback URLs (target-only, with params only) ─
+        for url in result.wayback_urls:
+            if not is_target(url) or is_static(url):
+                continue
+            if not urlparse(url).query:
+                continue
+            temp_ep = DiscoveredEndpoint(url=url, source="wayback")
+            param_urls.add(self._fuzz_endpoint(temp_ep).url)
 
-        # ── Step 3: Collect all unique real parameter names ───────────────
-        # Real params = found in URLs with query strings (not just JS variable names)
+        # ── Step 3: Collect real param names (from actual query strings) ──
+        # Only trust params found in real URLs, not JS variable names
         real_param_names: list[str] = sorted({
             p.name for p in result.parameters.values()
             if p.source in ("url-query", "html:form-field")
         })
-        # Also collect loose text params (found in JS — might be API params)
-        loose_param_names: list[str] = sorted({
-            p.name for p in result.parameters.values()
-            if p.source == "text"
-        })
-        all_param_names: list[str] = sorted(set(real_param_names) | set(loose_param_names))
 
-        # ── Step 4: Add fuzzed URLs for every param-bearing URL ───────────
-        seen_base_paths: set[str] = set()
-        for p in result.parameters.values():
-            if not p.url or not is_target(p.url):
+        # ── Step 4: API endpoint × real param cross-product ───────────────
+        # Generate: /api/v1?user=FUZZ, /api/v1?id=FUZZ etc.
+        # Only applies to real discovered API routes — NOT generated guesses
+        api_keywords = {"api", "rest", "graphql", "auth", "token", "login",
+                        "admin", "user", "account", "profile", "search", "query",
+                        "bucket", "home", "logout", "callback"}
+        
+        target_api_endpoints: set[str] = set()
+        for ep in result.endpoints.values():
+            if not is_target(ep.url) or is_static(ep.url):
                 continue
-            if is_static(p.url):
-                continue
-            temp_ep = DiscoveredEndpoint(url=p.url, source=p.source)
-            fuzzed = self._fuzz_endpoint(temp_ep).url
-            all_urls.add(fuzzed)
-            # Track which paths already have params so we don't double-add
-            parsed = urlparse(p.url)
-            seen_base_paths.add(parsed.path)
+            path = urlparse(ep.url).path.lower()
+            # Only pick paths that look like real API/page routes (not JS chunk URLs)
+            if any(kw in path for kw in api_keywords):
+                clean = urlparse(ep.url)._replace(query="", fragment="")
+                target_api_endpoints.add(urlunparse(clean))
 
-        # ── Step 5: Generate cross-product URLs ───────────────────────────
-        # For each non-static target endpoint × each real parameter name
-        # This generates: /api/v1?user=FUZZ, /api/v1?id=FUZZ etc.
-        endpoints_to_combine = (api_endpoints | page_endpoints) - set(result.visited_pages)
-        # Also include visited pages for completeness
-        for vp in result.visited_pages:
-            if is_target(vp) and not is_static(vp):
-                endpoints_to_combine.add(vp)
-
-        for ep in endpoints_to_combine:
-            parsed_ep = urlparse(ep)
-            # Only add individual param combinations for real params (not 379 loose ones)
-            for param in real_param_names:
-                new_url = urlunparse(parsed_ep._replace(
-                    query=f"{param}={self.placeholder}", fragment=""
-                ))
-                all_urls.add(new_url)
-            # Add all-in-one combined URL with all real params
-            if real_param_names:
-                combo_query = "&".join(f"{p}={self.placeholder}" for p in real_param_names)
-                all_urls.add(urlunparse(parsed_ep._replace(query=combo_query, fragment="")))
-
-        # ── Step 6: Loose param batch combinations on API routes ──────────
-        # Group loose params in batches of 5 applied to api endpoints
-        if loose_param_names and api_endpoints:
-            for ep in api_endpoints:
+        if real_param_names and target_api_endpoints:
+            for ep in target_api_endpoints:
                 parsed_ep = urlparse(ep)
-                for i in range(0, len(loose_param_names), 5):
-                    batch = loose_param_names[i:i + 5]
-                    query = "&".join(f"{name}={self.placeholder}" for name in batch)
-                    all_urls.add(urlunparse(parsed_ep._replace(query=query, fragment="")))
+                # Each real param individually
+                for param in real_param_names:
+                    param_urls.add(urlunparse(parsed_ep._replace(
+                        query=f"{param}={self.placeholder}", fragment=""
+                    )))
+                # All real params combined on one URL
+                combo = "&".join(f"{p}={self.placeholder}" for p in real_param_names)
+                param_urls.add(urlunparse(parsed_ep._replace(query=combo, fragment="")))
 
-        # ── Step 7: Passive wayback URLs (target-only, fuzzed) ───────────
-        for url in result.wayback_urls:
-            if is_target(url):
-                temp_ep = DiscoveredEndpoint(url=url, source="wayback")
-                all_urls.add(self._fuzz_endpoint(temp_ep).url)
-
-        # ── Final: Remove garbage non-URLs ────────────────────────────────
+        # ── Final: Only keep valid http/https URLs with a query string ────
         clean_urls = set()
-        for url in all_urls:
+        for url in param_urls:
             try:
                 p = urlparse(url)
-                if p.scheme in ("http", "https") and p.netloc:
+                if p.scheme in ("http", "https") and p.netloc and p.query:
                     clean_urls.add(url)
             except Exception:
                 continue
