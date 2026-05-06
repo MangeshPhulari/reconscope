@@ -23,7 +23,7 @@ BANNER = r"""
 |  _ <  __/ (_| (_) | | | | ___) | (_| (_) | |_) |  __/
 |_| \_\___|\___\___/|_| |_||____/ \___\___/| .__/ \___|
                                             |_|[/bold cyan]
-[dim]  v4.0  |  Ultimate Pentest Edition (API, JS, Secrets)  |  by Mangesh Phulari[/dim]
+[dim]  v4.5  |  Ultimate Pentest Edition (API, JS, Secrets)  |  by Mangesh Phulari[/dim]
 """
 
 
@@ -54,83 +54,72 @@ def print_results(
     endpoints_only: bool = False,
     flat: bool = False,
     silent: bool = False,
+    generated_url_count: int | None = None,
 ) -> None:
     """Print a color-coded summary of the recon result."""
     if silent:
         return
 
-    if flat:
-        # In flat mode, URLs were already printed to stdout. Just show summary table.
-        _print_summary_table(result)
-        return
-
     console.print()
-
-    if not params_only:
-        _print_endpoints(result)
-
-    if not endpoints_only:
-        _print_parameters(result)
-
-    if result.wayback_urls:
-        _print_passive(result)
-
-    if result.secrets:
-        _print_secrets(result)
-
-    _print_summary_table(result)
+    _print_summary_table(result, generated_url_count=generated_url_count, flat=flat)
 
 
-def _print_endpoints(result: "ReconResult") -> None:
-    if not result.endpoints:
-        console.print("[dim]No endpoints discovered.[/dim]")
-        return
-    console.print(f"[bold cyan]Endpoints[/bold cyan] — [dim]{len(result.endpoints)} found[/dim]")
-    for ep in sorted(result.endpoints.values(), key=lambda e: e.url):
-        console.print(f"  [cyan]{ep.url}[/cyan]  [dim]\\[{ep.source}][/dim]")
-    console.print()
-
-
-def _print_parameters(result: "ReconResult") -> None:
-    if not result.parameters:
-        console.print("[dim]No parameters discovered.[/dim]")
-        return
-    console.print(f"[bold yellow]Parameters[/bold yellow] — [dim]{len(result.parameters)} found[/dim]")
-    for param in sorted(result.parameters.values(), key=lambda p: p.name):
-        url_suffix = f"  [dim]{param.url}[/dim]" if param.url else ""
-        console.print(f"  [yellow]{param.name}[/yellow]  [dim]\\[{param.source}][/dim]{url_suffix}")
-    console.print()
-
-
-def _print_passive(result: "ReconResult") -> None:
-    console.print(f"[bold green]Passive URLs[/bold green] — [dim]{len(result.wayback_urls)} found[/dim]")
-    for url in sorted(result.wayback_urls):
-        console.print(f"  [green]{url}[/green]")
-    console.print()
-
-
-def _print_secrets(result: "ReconResult") -> None:
-    console.print(f"[bold red]Secrets Found[/bold red] — [dim]{len(result.secrets)} potential leaks[/dim]")
-    for s in result.secrets:
-        console.print(f"  [red]\\[{s.type}][/red] {s.value} [dim]({s.url})[/dim]")
-    console.print()
-
-
-def _print_summary_table(result: "ReconResult") -> None:
-    table = Table(title="[bold]Scan Summary[/bold]", box=box.ROUNDED, show_header=True, header_style="bold magenta")
+def _print_summary_table(
+    result: "ReconResult",
+    generated_url_count: int | None = None,
+    flat: bool = False,
+) -> None:
+    table = Table(
+        title="[bold]Scan Summary[/bold]",
+        box=box.ROUNDED,
+        show_header=True,
+        header_style="bold magenta",
+    )
     table.add_column("Metric", style="dim")
     table.add_column("Count", justify="right", style="bold white")
-    
+
     table.add_row("Pages visited", str(len(result.visited_pages)))
-    table.add_row("Endpoints Found", str(len(result.endpoints)))
-    
-    # Count how many URLs actually have parameters
-    param_urls_count = len({p.url for p in result.parameters.values() if p.url})
-    table.add_row("Parameterized URLs", str(param_urls_count))
-    table.add_row("Unique Param Names", str(len(result.parameters)))
-    
+
+    # Count target-only endpoints
+    from urllib.parse import urlparse
+    target_domain = result.target.replace("https://", "").replace("http://", "").split("/")[0]
+    target_ep_count = sum(
+        1 for ep in result.endpoints.values()
+        if urlparse(ep.url).netloc.lower() in (target_domain, f"www.{target_domain}")
+        or urlparse(ep.url).netloc.lower().endswith(f".{target_domain}")
+    )
+    table.add_row("Endpoints Found", str(target_ep_count))
+
+    # Real parameterized URLs (target-only, non-static)
+    static_exts = {".js", ".css", ".woff", ".woff2", ".png", ".jpg", ".gif", ".svg", ".ico", ".map", ".ttf", ".eot"}
+    param_urls = {
+        p.url for p in result.parameters.values()
+        if p.url
+        and (urlparse(p.url).netloc.lower() == target_domain
+             or urlparse(p.url).netloc.lower().endswith(f".{target_domain}"))
+        and not any(urlparse(p.url).path.lower().endswith(ext) for ext in static_exts)
+    }
+    table.add_row("Parameterized URLs (raw)", str(len(param_urls)))
+    table.add_row("Unique Param Names", str(len({p.name for p in result.parameters.values()})))
+
+    # Show the actually generated/written URL count if flat mode
+    if flat and generated_url_count is not None:
+        table.add_row("[bold green]URLs Written to File[/bold green]", f"[bold green]{generated_url_count}[/bold green]")
+
     table.add_row("Passive URLs", str(len(result.wayback_urls)))
-    table.add_row("Secrets Found", str(len(result.secrets)))
-    
+
+    if result.secrets:
+        table.add_row("[bold red]Secrets Found[/bold red]", f"[bold red]{len(result.secrets)}[/bold red]")
+    else:
+        table.add_row("Secrets Found", "0")
+
     console.print(table)
+
+    # Show secrets details if any
+    if result.secrets:
+        console.print()
+        console.print("[bold red]⚠  Potential Secrets / Leaks Detected![/bold red]")
+        for s in result.secrets:
+            console.print(f"  [red][{s.type}][/red]  {s.value}  [dim]({s.url})[/dim]")
+
     console.print()

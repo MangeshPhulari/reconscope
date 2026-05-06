@@ -267,6 +267,14 @@ def main(argv: list[str] | None = None) -> int:
         
     # Always print the summary to stdout if not silent
     if not args.silent:
-        print_results(result, params_only=args.params_only, endpoints_only=args.endpoints_only, flat=args.flat)
+        # Count actual lines written to the file for accurate summary
+        generated_url_count = len([l for l in output.splitlines() if l.strip()]) if (args.flat or args.endpoints_only) else None
+        print_results(
+            result,
+            params_only=args.params_only,
+            endpoints_only=args.endpoints_only,
+            flat=args.flat,
+            generated_url_count=generated_url_count,
+        )
 
     return 0
