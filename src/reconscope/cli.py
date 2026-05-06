@@ -248,9 +248,8 @@ def main(argv: list[str] | None = None) -> int:
         if not args.silent:
             console.print(f"[bold green]Report Saved:[/bold green] {saved}")
         
-        # Also print to stdout if not silent
-        if not args.silent:
-            # We don't print the whole huge output to terminal again, just a summary
-            print_results(result, params_only=args.params_only, endpoints_only=args.endpoints_only, flat=args.flat)
+    # Always print the summary to stdout if not silent
+    if not args.silent:
+        print_results(result, params_only=args.params_only, endpoints_only=args.endpoints_only, flat=args.flat)
 
     return 0
