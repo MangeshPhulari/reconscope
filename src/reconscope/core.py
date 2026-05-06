@@ -804,24 +804,70 @@ class ReconScope:
             return False
 
     def export_endpoints_only(self, result: ReconResult) -> str:
-        """Clean list of target-only endpoints."""
+        """
+        Clean list of target-only endpoints — NO query parameters, NO static assets.
+        Every URL is stripped of ?query and #fragment, deduplicated by path.
+        Use --flat for parameterized URLs.
+        """
         target_domain = result.target.replace("https://", "").replace("http://", "").split("/")[0]
-        urls = set()
-        for ep in result.endpoints.values():
-            try:
-                host = urlparse(ep.url).netloc.lower()
-                if host == target_domain or host.endswith(f".{target_domain}"):
-                    urls.add(ep.url)
-            except Exception:
-                continue
-        for url in result.wayback_urls:
+
+        static_exts = {".js", ".css", ".woff", ".woff2", ".png", ".jpg", ".jpeg",
+                       ".gif", ".svg", ".ico", ".map", ".ttf", ".eot", ".otf",
+                       ".pdf", ".zip", ".tar", ".gz"}
+
+        def is_target(url: str) -> bool:
             try:
                 host = urlparse(url).netloc.lower()
-                if host == target_domain or host.endswith(f".{target_domain}"):
-                    urls.add(url)
+                return host == target_domain or host.endswith(f".{target_domain}")
+            except Exception:
+                return False
+
+        def is_static(path: str) -> bool:
+            return any(path.lower().endswith(ext) for ext in static_exts)
+
+        clean_urls: set[str] = set()
+
+        # From live crawl endpoints
+        for ep in result.endpoints.values():
+            if not is_target(ep.url):
+                continue
+            try:
+                p = urlparse(ep.url)
+                if is_static(p.path):
+                    continue
+                # Strip query string and fragment — endpoints only
+                clean = urlunparse(p._replace(query="", fragment=""))
+                clean_urls.add(clean)
             except Exception:
                 continue
-        return "\n".join(sorted(urls))
+
+        # From passive wayback URLs
+        for url in result.wayback_urls:
+            if not is_target(url):
+                continue
+            try:
+                p = urlparse(url)
+                if is_static(p.path):
+                    continue
+                clean = urlunparse(p._replace(query="", fragment=""))
+                clean_urls.add(clean)
+            except Exception:
+                continue
+
+        # From visited pages (crawler footprint)
+        for url in result.visited_pages:
+            if not is_target(url):
+                continue
+            try:
+                p = urlparse(url)
+                if is_static(p.path):
+                    continue
+                clean = urlunparse(p._replace(query="", fragment=""))
+                clean_urls.add(clean)
+            except Exception:
+                continue
+
+        return "\n".join(sorted(clean_urls))
 
     def export_urls_only(self, result: ReconResult) -> str:
         """
