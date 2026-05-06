@@ -623,7 +623,10 @@ class ReconScope:
     # ------------------------------------------------------------------
 
     def _resolve(self, base_url: str, candidate: str) -> str:
-        return self._canonicalize(urlparse(urljoin(base_url, candidate)))
+        try:
+            return self._canonicalize(urlparse(urljoin(base_url, candidate)))
+        except (ValueError, Exception):
+            return ""
 
     def _normalize_target(self, target: str) -> urlparse:
         if "//" not in target:
